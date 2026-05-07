@@ -41,7 +41,9 @@ async def start_auto_writing_task(
             theme=payload.theme,
             genre=payload.genre,
             target_words=payload.target_total_words,
-            wizard_status="incomplete",
+            status="writing",
+            wizard_status="completed",
+            wizard_step=4,
             outline_mode=payload.outline_mode,
         )
         db.add(project)
@@ -53,7 +55,7 @@ async def start_auto_writing_task(
             BackgroundTask.user_id == user_id,
             BackgroundTask.project_id == project.id,
             BackgroundTask.task_type == "auto_writing",
-            BackgroundTask.status.in_(["pending", "running"]),
+            BackgroundTask.status.in_(["pending", "running", "paused"]),
         )
     )
     active_task = active_result.scalar_one_or_none()
@@ -112,14 +114,32 @@ async def pause_auto_writing_task(
     return _task_to_response(task)
 
 
-@router.post("/{task_id}/resume", summary="恢复自动写作")
+@router.post("/{task_id}/resume", response_model=AutoWritingTaskDetailResponse, summary="恢复自动写作")
 async def resume_auto_writing_task(
     task_id: str,
     request: Request,
     db: AsyncSession = Depends(get_db),
 ):
-    await _get_auto_writing_task_or_404(task_id, request, db)
-    raise HTTPException(status_code=400, detail="自动写作恢复将在后续版本支持")
+    task = await _get_auto_writing_task_or_404(task_id, request, db)
+    if task.status != "paused":
+        raise HTTPException(status_code=400, detail="只能恢复已暂停的自动写作任务")
+
+    user_id = getattr(request.state, "user_id", None)
+    task.status = "pending"
+    task.cancel_requested = False
+    task.status_message = "任务已恢复，等待执行..."
+    task.progress_details = {"stage": "queued", "message": "任务已恢复，等待执行..."}
+    task.completed_at = None
+    task.updated_at = datetime.now()
+    await db.commit()
+    await db.refresh(task)
+    await background_task_service.spawn_background_task(
+        task.id,
+        user_id,
+        run_auto_writing_background,
+    )
+    await db.refresh(task)
+    return _task_to_response(task)
 
 
 @router.post("/{task_id}/cancel", response_model=AutoWritingTaskDetailResponse, summary="取消自动写作")

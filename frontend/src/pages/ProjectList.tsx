@@ -875,6 +875,7 @@ export default function ProjectList() {
               onGoSettings={() => changeView('settings')}
               onStartWizard={() => navigate('/wizard')}
               onOpenInspiration={() => navigate('/inspiration')}
+              onOpenAutoWriting={() => navigate('/auto-writing/new')}
               onEnterProject={handleEnterProject}
               onDeleteProject={handleDelete}
               onGenerateCover={handleGenerateCover}

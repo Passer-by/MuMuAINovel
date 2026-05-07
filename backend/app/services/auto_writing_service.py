@@ -1,6 +1,7 @@
 """自动写作后台编排服务"""
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional
@@ -14,6 +15,7 @@ from app.models.analysis_task import AnalysisTask
 from app.models.background_task import BackgroundTask
 from app.models.chapter import Chapter
 from app.models.memory import PlotAnalysis
+from app.models.outline import Outline
 from app.models.project import Project
 from app.models.regeneration_task import RegenerationTask
 from app.models.writing_style import WritingStyle
@@ -118,6 +120,65 @@ def build_quality_failure_record(
     }
 
 
+def build_seed_chapter_plans_from_idea(task_input: Dict[str, Any], chapter_count: int) -> List[Dict[str, Any]]:
+    """根据新想法输入生成可落库的初始章节草稿计划。"""
+    if chapter_count <= 0:
+        return []
+
+    title = (task_input.get("title") or "未命名作品").strip()
+    description = (task_input.get("description") or "围绕主角的核心选择与冲突展开。").strip()
+    theme = (task_input.get("theme") or "成长与选择").strip()
+    genre = (task_input.get("genre") or "通用").strip()
+    beats = [
+        ("开端", "交代主角处境、核心欲望与故事钩子，埋下主要矛盾。"),
+        ("异变", "外部事件打破平衡，主角被迫进入新的行动轨道。"),
+        ("选择", "主角面对代价明确的选择，人物关系和目标发生变化。"),
+        ("冲突", "对手或环境压力升级，主线目标遭遇实质阻碍。"),
+        ("转折", "关键信息揭露，主角对世界或自身的认知被改写。"),
+        ("代价", "行动结果带来损失或牺牲，为后续更大冲突蓄力。"),
+        ("推进", "主角整合资源主动出击，阶段性悬念继续扩大。"),
+        ("悬念", "以新的危险、承诺或秘密收束本阶段剧情。"),
+    ]
+
+    plans: List[Dict[str, Any]] = []
+    for index in range(1, chapter_count + 1):
+        beat_name, beat_goal = beats[(index - 1) % len(beats)]
+        chapter_title = f"第{index}章：{beat_name}"
+        summary = (
+            f"《{title}》第{index}章围绕“{description}”展开。"
+            f"本章类型为{genre}，主题聚焦{theme}。{beat_goal}"
+        )
+        structure = {
+            "chapter_number": index,
+            "title": chapter_title,
+            "project_title": title,
+            "genre": genre,
+            "theme": theme,
+            "summary": summary,
+            "scenes": [
+                "用具体行动呈现主角当前处境",
+                "让冲突在场景中升级并留下后续钩子",
+            ],
+            "characters": [],
+            "key_points": [
+                "推进主线冲突",
+                "保持人物动机清晰",
+                "结尾留下下一章驱动力",
+            ],
+            "emotion": "紧张递进",
+            "goal": beat_goal,
+        }
+        plans.append(
+            {
+                "chapter_number": index,
+                "title": chapter_title,
+                "summary": summary,
+                "structure": structure,
+            }
+        )
+    return plans
+
+
 def _quality_config_from_task_input(task_input: Dict[str, Any]) -> QualityGateConfig:
     quality = task_input.get("quality") or {}
     return QualityGateConfig(
@@ -166,21 +227,108 @@ async def run_auto_writing_background(task_id: str, user_id: str) -> None:
                 await _mark_task_failed(db, task, "项目不存在")
                 return
 
-            if task_input.get("mode", "existing_project") != "existing_project":
-                await _mark_task_completed(
-                    db,
-                    task,
-                    "新想法自动展开将在后续版本支持，已创建项目",
-                    {"message": "新想法自动展开将在后续版本支持，已创建项目"},
-                )
-                return
+            if task_input.get("mode", "existing_project") == "new_idea":
+                await tracker.loading("创建初始大纲与章节草稿...", 0.2)
+                await ensure_seed_chapters_for_new_idea(db, project, task_input)
 
             await tracker.loading("加载章节列表...", 0.4)
-            await _run_existing_project_batch(db, task, project, user_id, tracker)
+            await _run_writing_loop(db, task, project, user_id, tracker)
 
     except Exception as exc:
         logger.error(f"自动写作任务失败: {task_id}", exc_info=True)
         await tracker.error(str(exc))
+
+
+async def ensure_seed_chapters_for_new_idea(
+    db: AsyncSession,
+    project: Project,
+    task_input: Dict[str, Any],
+) -> int:
+    """为新想法项目创建初始大纲和章节草稿，已有章节时不重复创建。"""
+    existing_result = await db.execute(
+        select(Chapter.id).where(Chapter.project_id == project.id).limit(1)
+    )
+    if existing_result.scalar_one_or_none():
+        return 0
+
+    target_words = int(task_input.get("target_total_words") or 100000)
+    words_per_chapter = max(int(task_input.get("target_words_per_chapter") or 3000), 1)
+    estimated_chapters = max(1, (target_words + words_per_chapter - 1) // words_per_chapter)
+    seed_count = min(int(task_input.get("max_chapters") or estimated_chapters), 200)
+    plans = build_seed_chapter_plans_from_idea(task_input, seed_count)
+    for plan in plans:
+        outline = Outline(
+            project_id=project.id,
+            title=plan["title"],
+            content=plan["summary"],
+            structure=json.dumps(plan["structure"], ensure_ascii=False),
+            order_index=plan["chapter_number"],
+        )
+        db.add(outline)
+        await db.flush()
+        chapter = Chapter(
+            project_id=project.id,
+            chapter_number=plan["chapter_number"],
+            title=plan["title"],
+            summary=plan["summary"],
+            content="",
+            word_count=0,
+            status="draft",
+            outline_id=outline.id,
+            sub_index=1,
+            expansion_plan=json.dumps(plan["structure"], ensure_ascii=False),
+        )
+        db.add(chapter)
+
+    project.wizard_status = "completed"
+    project.wizard_step = 4
+    project.status = "writing"
+    project.chapter_count = max(project.chapter_count or 0, len(plans))
+    await db.commit()
+    return len(plans)
+
+
+async def _run_writing_loop(
+    db: AsyncSession,
+    task: BackgroundTask,
+    project: Project,
+    user_id: str,
+    tracker: TaskProgressTracker,
+) -> None:
+    previous_result = task.task_result or {}
+    total_generated = int(previous_result.get("generated_chapters") or 0)
+    previous_failures = previous_result.get("quality_failures")
+    quality_failures: List[Dict[str, Any]] = (
+        list(previous_failures) if isinstance(previous_failures, list) else []
+    )
+    consecutive_failures = 0
+
+    while True:
+        await db.refresh(task)
+        await db.refresh(project)
+        if task.cancel_requested or task.status == "cancelled":
+            await _mark_task_cancelled(db, task)
+            return
+        if task.status == "paused":
+            return
+
+        batch_result = await _run_existing_project_batch(
+            db=db,
+            task=task,
+            project=project,
+            user_id=user_id,
+            tracker=tracker,
+            existing_quality_failures=quality_failures,
+            starting_consecutive_failures=consecutive_failures,
+            starting_generated_count=total_generated,
+        )
+        total_generated += batch_result["generated_count"]
+        quality_failures = batch_result["quality_failures"]
+        consecutive_failures = batch_result["consecutive_failures"]
+
+        if batch_result["status"] == "continue":
+            continue
+        return
 
 
 async def _run_existing_project_batch(
@@ -189,7 +337,10 @@ async def _run_existing_project_batch(
     project: Project,
     user_id: str,
     tracker: TaskProgressTracker,
-) -> None:
+    existing_quality_failures: Optional[List[Dict[str, Any]]] = None,
+    starting_consecutive_failures: int = 0,
+    starting_generated_count: int = 0,
+) -> Dict[str, Any]:
     task_input = task.task_input or {}
     quality_input = task_input.get("quality") or {}
     quality_config = _quality_config_from_task_input(task_input)
@@ -209,15 +360,29 @@ async def _run_existing_project_batch(
         current_words=project.current_words or 0,
         target_total_words=task_input.get("target_total_words"),
         max_chapters=task_input.get("max_chapters"),
-        current_chapter_count=len(chapters),
+        current_chapter_count=starting_generated_count,
     ):
         await _mark_task_completed(
             db,
             task,
             "自动写作完成：已达到目标字数或章节数",
-            {"message": "已达到目标字数或章节数", "generated_chapters": 0, "quality_failures": []},
+            {
+                "message": "已达到目标字数或章节数",
+                "generated_chapters": starting_generated_count,
+                "quality_failures": existing_quality_failures or [],
+            },
         )
-        return
+        return {
+            "status": "completed",
+            "generated_count": 0,
+            "quality_failures": existing_quality_failures or [],
+            "consecutive_failures": starting_consecutive_failures,
+        }
+
+    max_chapters = task_input.get("max_chapters")
+    if max_chapters is not None:
+        remaining_chapters = max(int(max_chapters) - starting_generated_count, 0)
+        chapters_per_batch = min(chapters_per_batch, remaining_chapters)
 
     selected_chapters = select_chapters_for_batch(chapters, chapters_per_batch)
     if not selected_chapters:
@@ -225,9 +390,18 @@ async def _run_existing_project_batch(
             db,
             task,
             "没有可生成章节，请先生成或展开大纲",
-            {"message": "没有可生成章节，请先生成或展开大纲", "generated_chapters": 0, "quality_failures": []},
+            {
+                "message": "没有可生成章节，请先生成或展开大纲",
+                "generated_chapters": starting_generated_count,
+                "quality_failures": existing_quality_failures or [],
+            },
         )
-        return
+        return {
+            "status": "completed",
+            "generated_count": 0,
+            "quality_failures": existing_quality_failures or [],
+            "consecutive_failures": starting_consecutive_failures,
+        }
 
     await tracker.preparing(f"准备生成 {len(selected_chapters)} 个章节...")
 
@@ -246,16 +420,26 @@ async def _run_existing_project_batch(
     write_lock = await get_db_write_lock(user_id)
     previous_summary_context = None
     generated_count = 0
-    consecutive_failures = 0
-    quality_failures: List[Dict[str, Any]] = []
+    consecutive_failures = starting_consecutive_failures
+    quality_failures: List[Dict[str, Any]] = list(existing_quality_failures or [])
 
     for index, chapter in enumerate(selected_chapters, start=1):
         await db.refresh(task)
         if task.cancel_requested or task.status == "cancelled":
             await _mark_task_cancelled(db, task)
-            return
+            return {
+                "status": "cancelled",
+                "generated_count": generated_count,
+                "quality_failures": quality_failures,
+                "consecutive_failures": consecutive_failures,
+            }
         if task.status == "paused":
-            return
+            return {
+                "status": "paused",
+                "generated_count": generated_count,
+                "quality_failures": quality_failures,
+                "consecutive_failures": consecutive_failures,
+            }
 
         await tracker.generating(
             current_chars=index - 1,
@@ -317,31 +501,32 @@ async def _run_existing_project_batch(
                     db,
                     task,
                     f"连续 {consecutive_failures} 章质量未达标，任务已暂停",
-                    generated_count,
+                    starting_generated_count + generated_count,
                     quality_failures,
                 )
-                return
+                return {
+                    "status": "paused",
+                    "generated_count": generated_count,
+                    "quality_failures": quality_failures,
+                    "consecutive_failures": consecutive_failures,
+                }
 
         task.progress = min(95, int(index / len(selected_chapters) * 95))
         task.status_message = f"已完成 {index}/{len(selected_chapters)} 章"
         task.task_result = {
             "message": "自动写作进行中",
-            "generated_chapters": generated_count,
+            "generated_chapters": starting_generated_count + generated_count,
             "quality_failures": quality_failures,
         }
         task.updated_at = datetime.now()
         await db.commit()
 
-    await _mark_task_completed(
-        db,
-        task,
-        f"自动写作批次完成，生成 {generated_count} 章",
-        {
-            "message": f"自动写作批次完成，生成 {generated_count} 章",
-            "generated_chapters": generated_count,
-            "quality_failures": quality_failures,
-        },
-    )
+    return {
+        "status": "continue",
+        "generated_count": generated_count,
+        "quality_failures": quality_failures,
+        "consecutive_failures": consecutive_failures,
+    }
 
 
 async def _load_task(db: AsyncSession, task_id: str, user_id: str) -> Optional[BackgroundTask]:
@@ -470,8 +655,6 @@ async def _regenerate_apply_and_analyze(
 
 
 async def _build_regeneration_context(db: AsyncSession, chapter: Chapter) -> Dict[str, Any]:
-    from app.models.outline import Outline
-
     project = await db.get(Project, chapter.project_id)
     outline = None
     if chapter.outline_id:

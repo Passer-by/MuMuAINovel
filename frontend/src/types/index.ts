@@ -662,6 +662,7 @@ export interface AutoWritingStartRequest {
   description?: string;
   theme?: string;
   genre?: string;
+  outline_mode?: 'one-to-one' | 'one-to-many';
 }
 
 export interface AutoWritingStartResponse {

@@ -20,6 +20,7 @@ interface BookshelfPageProps {
   onGoSettings: () => void;
   onStartWizard: () => void;
   onOpenInspiration: () => void;
+  onOpenAutoWriting: () => void;
   onEnterProject: (project: Project) => void;
   onDeleteProject: (projectId: string) => void;
   onGenerateCover: (project: Project, overwrite?: boolean) => void | Promise<void>;
@@ -44,6 +45,7 @@ export default function BookshelfPage({
   onGoSettings,
   onStartWizard,
   onOpenInspiration,
+  onOpenAutoWriting,
   onEnterProject,
   onDeleteProject,
   onGenerateCover,
@@ -339,6 +341,19 @@ export default function BookshelfPage({
                     block
                   >
                     灵感模式
+                  </Button>
+                  <Button
+                    size={isMobile ? 'middle' : 'large'}
+                    icon={<EditOutlined />}
+                    onClick={onOpenAutoWriting}
+                    style={{
+                      height: isMobile ? 42 : 52,
+                      fontSize: isMobile ? '14px' : '16px',
+                      borderRadius: 10,
+                    }}
+                    block
+                  >
+                    自动写作
                   </Button>
                 </div>
 

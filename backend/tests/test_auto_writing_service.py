@@ -7,6 +7,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app.services.auto_writing_service import (
     QualityGateConfig,
     QualityScores,
+    build_seed_chapter_plans_from_idea,
     build_quality_failure_record,
     evaluate_quality_gate,
     select_chapters_for_batch,
@@ -156,3 +157,26 @@ def test_quality_defaults_match_auto_writing_design():
     assert request.quality.coherence_threshold == 7.0
     assert request.quality.max_quality_retries == 2
     assert request.quality.consecutive_failure_limit == 3
+
+
+def test_build_seed_chapter_plans_from_idea_uses_story_setup():
+    plans = build_seed_chapter_plans_from_idea(
+        {
+            "title": "星海旧约",
+            "description": "流亡舰队在失落星门前发现旧文明遗产。",
+            "theme": "信任与牺牲",
+            "genre": "科幻",
+        },
+        chapter_count=3,
+    )
+
+    assert [plan["chapter_number"] for plan in plans] == [1, 2, 3]
+    assert plans[0]["title"].startswith("第1章")
+    assert "星海旧约" in plans[0]["summary"]
+    assert "流亡舰队" in plans[0]["summary"]
+    assert plans[0]["structure"]["genre"] == "科幻"
+    assert plans[1]["structure"]["goal"]
+
+
+def test_build_seed_chapter_plans_limits_to_positive_count():
+    assert build_seed_chapter_plans_from_idea({}, chapter_count=0) == []

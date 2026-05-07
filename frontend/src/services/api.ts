@@ -521,6 +521,9 @@ export const autoWritingApi = {
   pause: (taskId: string) =>
     api.post<unknown, AutoWritingTaskDetail>(`/auto-writing/${taskId}/pause`, {}),
 
+  resume: (taskId: string) =>
+    api.post<unknown, AutoWritingTaskDetail>(`/auto-writing/${taskId}/resume`, {}),
+
   cancel: (taskId: string) =>
     api.post<unknown, AutoWritingTaskDetail>(`/auto-writing/${taskId}/cancel`, {}),
 };
