@@ -7,9 +7,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app.services.auto_writing_service import (
     QualityGateConfig,
     QualityScores,
+    build_auto_writing_planning_prompt,
     build_seed_chapter_plans_from_idea,
     build_quality_failure_record,
+    build_quality_retry_instruction,
+    calculate_seed_chapter_count,
+    extract_auto_writing_plan_from_ai_response,
+    _chapter_title_for_number,
     evaluate_quality_gate,
+    is_pause_or_cancel_requested,
     select_chapters_for_batch,
     should_continue_writing,
     should_pause_for_quality_failures,
@@ -180,3 +186,84 @@ def test_build_seed_chapter_plans_from_idea_uses_story_setup():
 
 def test_build_seed_chapter_plans_limits_to_positive_count():
     assert build_seed_chapter_plans_from_idea({}, chapter_count=0) == []
+
+
+def test_calculate_seed_chapter_count_uses_target_words_and_cap():
+    assert calculate_seed_chapter_count({"target_total_words": 12000, "target_words_per_chapter": 3000}) == 4
+    assert calculate_seed_chapter_count({"target_total_words": 900000, "target_words_per_chapter": 1000}) == 200
+    assert calculate_seed_chapter_count({"max_chapters": 6, "target_total_words": 50000}) == 6
+
+
+def test_extract_auto_writing_plan_accepts_ai_json_object():
+    plan = extract_auto_writing_plan_from_ai_response(
+        """
+        {
+          "world": {"time_period": "未来", "location": "星门边境", "atmosphere": "冷峻", "rules": "跃迁受限"},
+          "characters": [{"name": "林澈", "role_type": "protagonist", "personality": "谨慎"}],
+          "chapters": [{"title": "失落信标", "summary": "舰队发现异常信号", "goal": "引出主线"}]
+        }
+        """,
+        {"title": "星海旧约", "genre": "科幻", "theme": "信任"},
+        chapter_count=1,
+    )
+
+    assert plan["world"]["location"] == "星门边境"
+    assert plan["characters"][0]["name"] == "林澈"
+    assert plan["chapters"][0]["title"].startswith("第1章")
+    assert plan["chapters"][0]["structure"]["goal"] == "引出主线"
+
+
+def test_extract_auto_writing_plan_falls_back_when_json_invalid():
+    plan = extract_auto_writing_plan_from_ai_response(
+        "这不是 JSON",
+        {"title": "星海旧约", "description": "舰队发现遗产"},
+        chapter_count=2,
+    )
+
+    assert plan["source"] == "fallback"
+    assert len(plan["chapters"]) == 2
+    assert plan["world"]["rules"]
+
+
+def test_build_auto_writing_planning_prompt_requires_structured_json():
+    prompt = build_auto_writing_planning_prompt(
+        {"title": "星海旧约", "description": "舰队发现遗产", "genre": "科幻", "theme": "信任"},
+        chapter_count=5,
+    )
+
+    assert "严格返回 JSON" in prompt
+    assert "5 个章节计划" in prompt
+    assert "星海旧约" in prompt
+
+
+def test_build_quality_retry_instruction_includes_failed_scores_and_suggestions():
+    analysis = SimpleNamespace(
+        suggestions=["加强冲突", "补足人物动机"],
+        pacing_score=6.0,
+        coherence_score=6.5,
+    )
+    instruction = build_quality_retry_instruction(
+        scores=QualityScores(overall=6.0, coherence=6.5, pacing=6.0, engagement=7.0),
+        gate_result=evaluate_quality_gate(
+            QualityScores(overall=6.0, coherence=6.5, pacing=6.0, engagement=7.0),
+            QualityGateConfig(overall_threshold=7.5, coherence_threshold=7.0),
+        ),
+        analysis=analysis,
+    )
+
+    assert "overall" in instruction
+    assert "coherence" in instruction
+    assert "加强冲突" in instruction
+    assert "人物动机" in instruction
+
+
+def test_is_pause_or_cancel_requested_checks_status_and_cancel_flag():
+    assert is_pause_or_cancel_requested(SimpleNamespace(status="paused", cancel_requested=False)) is True
+    assert is_pause_or_cancel_requested(SimpleNamespace(status="cancelled", cancel_requested=False)) is True
+    assert is_pause_or_cancel_requested(SimpleNamespace(status="running", cancel_requested=True)) is True
+    assert is_pause_or_cancel_requested(SimpleNamespace(status="running", cancel_requested=False)) is False
+
+
+def test_chapter_title_for_number_rewrites_stale_number_prefix():
+    assert _chapter_title_for_number("第1章：开端", 12) == "第12章：开端"
+    assert _chapter_title_for_number("转折", 5) == "第5章：转折"

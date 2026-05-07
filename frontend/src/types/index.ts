@@ -672,6 +672,8 @@ export interface AutoWritingStartResponse {
   message?: string;
 }
 
+export type BackgroundTaskStatusValue = 'pending' | 'running' | 'paused' | 'completed' | 'failed' | 'cancelled';
+
 export interface AutoWritingFailureRecord {
   chapter_id?: string;
   chapter_number?: number;
@@ -685,7 +687,7 @@ export interface AutoWritingFailureRecord {
 export interface AutoWritingTaskDetail {
   task_id: string;
   project_id: string;
-  status: 'pending' | 'running' | 'completed' | 'failed' | 'cancelled' | 'paused' | string;
+  status: BackgroundTaskStatusValue | string;
   progress?: number;
   status_message?: string | null;
   task_result?: {

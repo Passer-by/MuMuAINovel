@@ -2,13 +2,15 @@
  * 后台任务服务 - 轮询任务进度，替代SSE
  */
 
+import type { BackgroundTaskStatusValue } from '../types';
+
 const API_BASE = '/api/tasks';
 
 export interface TaskStatus {
   id: string;
   task_type: string;
   project_id: string;
-  status: 'pending' | 'running' | 'completed' | 'failed' | 'cancelled';
+  status: BackgroundTaskStatusValue;
   progress: number; // 0-100
   status_message: string | null;
   progress_details: {
@@ -106,6 +108,36 @@ export async function cancelTask(taskId: string): Promise<void> {
   const response = await fetch(`${API_BASE}/${taskId}/cancel`, { method: 'POST' });
   if (!response.ok) {
     throw new Error(`取消任务失败: ${response.statusText}`);
+  }
+}
+
+/**
+ * 暂停自动写作任务
+ */
+export async function pauseAutoWritingTask(taskId: string): Promise<void> {
+  const response = await fetch(`/api/auto-writing/${taskId}/pause`, { method: 'POST' });
+  if (!response.ok) {
+    throw new Error(`暂停自动写作任务失败: ${response.statusText}`);
+  }
+}
+
+/**
+ * 恢复自动写作任务
+ */
+export async function resumeAutoWritingTask(taskId: string): Promise<void> {
+  const response = await fetch(`/api/auto-writing/${taskId}/resume`, { method: 'POST' });
+  if (!response.ok) {
+    throw new Error(`恢复自动写作任务失败: ${response.statusText}`);
+  }
+}
+
+/**
+ * 取消自动写作任务
+ */
+export async function cancelAutoWritingTask(taskId: string): Promise<void> {
+  const response = await fetch(`/api/auto-writing/${taskId}/cancel`, { method: 'POST' });
+  if (!response.ok) {
+    throw new Error(`取消自动写作任务失败: ${response.statusText}`);
   }
 }
 

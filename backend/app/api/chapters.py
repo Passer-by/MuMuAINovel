@@ -5,7 +5,7 @@ from sqlalchemy import select, func
 from sqlalchemy.orm import selectinload
 import json
 import asyncio
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 from datetime import datetime
 from asyncio import Queue, Lock
 
@@ -3417,7 +3417,8 @@ async def generate_single_chapter_for_batch(
     ai_service: AIService,
     write_lock: Lock,
     custom_model: Optional[str] = None,
-    previous_summary_context: Optional[str] = None
+    previous_summary_context: Optional[str] = None,
+    should_stop: Optional[Callable[[], Awaitable[bool]]] = None
 ) -> Optional[str]:
     """
     为批量生成执行单个章节的生成（非流式）
@@ -3631,6 +3632,9 @@ async def generate_single_chapter_for_batch(
     
     # 批量生成中的流式生成（非SSE，不需要修改进度显示）
     async for chunk in ai_service.generate_text_stream(**generate_kwargs):
+        if should_stop and await should_stop():
+            logger.info(f"⏸️ 单章节生成被请求停止: 第{chapter.chapter_number}章")
+            raise asyncio.CancelledError("章节生成已暂停或取消")
         full_content += chunk
     
     # 更新章节内容到数据库（使用锁保护）
@@ -4486,4 +4490,3 @@ async def apply_partial_regenerate(
         "old_word_count": old_word_count,
         "message": "局部重写已应用"
     }
-

@@ -10,8 +10,21 @@ import {
   UpOutlined,
   DownOutlined,
   ClearOutlined,
+  PauseCircleOutlined,
+  PlayCircleOutlined,
+  StopOutlined,
 } from '@ant-design/icons';
-import { getProjectTasks, cancelTask, cancelBatchTask, deleteTask, clearProjectTasks, type TaskStatus } from '../services/backgroundTaskService';
+import {
+  getProjectTasks,
+  cancelTask,
+  cancelBatchTask,
+  cancelAutoWritingTask,
+  pauseAutoWritingTask,
+  resumeAutoWritingTask,
+  deleteTask,
+  clearProjectTasks,
+  type TaskStatus,
+} from '../services/backgroundTaskService';
 import { eventBus } from '../store/eventBus';
 
 interface FloatingTaskPanelProps {
@@ -32,6 +45,10 @@ export const FloatingTaskPanel: React.FC<FloatingTaskPanelProps> = ({
   const [collapsed, setCollapsed] = useState(true); // 默认收起
   const userCollapsedRef = useRef(false); // 用户手动收起标记
   const { token } = theme.useToken();
+
+  const isAutoWritingTask = (task: TaskStatus) => task.task_type === 'auto_writing';
+  const isRefreshingStatus = (status: TaskStatus['status']) =>
+    status === 'running' || status === 'pending' || status === 'paused';
 
   // 加载任务列表
   const loadTasks = useCallback(async () => {
@@ -69,7 +86,7 @@ export const FloatingTaskPanel: React.FC<FloatingTaskPanelProps> = ({
   // 有活跃任务时自动展开（仅当用户没有手动收起时）
   useEffect(() => {
     const hasActiveTasks = taskList.some(
-      (t) => t.status === 'running' || t.status === 'pending'
+      (t) => isRefreshingStatus(t.status)
     );
     if (hasActiveTasks && !userCollapsedRef.current) {
       setCollapsed(false);
@@ -79,7 +96,7 @@ export const FloatingTaskPanel: React.FC<FloatingTaskPanelProps> = ({
   // 自动刷新（仅当有运行中或等待中的任务时）
   useEffect(() => {
     const hasActiveTasks = taskList.some(
-      (t) => t.status === 'running' || t.status === 'pending'
+      (t) => isRefreshingStatus(t.status)
     );
     
     if (!hasActiveTasks) return;
@@ -91,7 +108,9 @@ export const FloatingTaskPanel: React.FC<FloatingTaskPanelProps> = ({
   // 取消任务
   const handleCancelTask = async (task: TaskStatus) => {
     try {
-      if (task.task_type === 'chapter_batch') {
+      if (isAutoWritingTask(task)) {
+        await cancelAutoWritingTask(task.id);
+      } else if (task.task_type === 'chapter_batch') {
         await cancelBatchTask(task.id);
       } else {
         await cancelTask(task.id);
@@ -99,6 +118,24 @@ export const FloatingTaskPanel: React.FC<FloatingTaskPanelProps> = ({
       loadTasks();
     } catch (error) {
       console.error('取消任务失败:', error);
+    }
+  };
+
+  const handlePauseTask = async (task: TaskStatus) => {
+    try {
+      await pauseAutoWritingTask(task.id);
+      loadTasks();
+    } catch (error) {
+      console.error('暂停任务失败:', error);
+    }
+  };
+
+  const handleResumeTask = async (task: TaskStatus) => {
+    try {
+      await resumeAutoWritingTask(task.id);
+      loadTasks();
+    } catch (error) {
+      console.error('恢复任务失败:', error);
     }
   };
 
@@ -131,6 +168,8 @@ export const FloatingTaskPanel: React.FC<FloatingTaskPanelProps> = ({
         return <Tag icon={<ClockCircleOutlined />} color="default">等待中</Tag>;
       case 'running':
         return <Tag icon={<LoadingOutlined />} color="processing">运行中</Tag>;
+      case 'paused':
+        return <Tag icon={<PauseCircleOutlined />} color="warning">已暂停</Tag>;
       case 'completed':
         return <Tag icon={<CheckCircleOutlined />} color="success">已完成</Tag>;
       case 'failed':
@@ -166,7 +205,7 @@ export const FloatingTaskPanel: React.FC<FloatingTaskPanelProps> = ({
     }
   };
 
-  const activeTasks = taskList.filter((t) => t.status === 'running' || t.status === 'pending');
+  const activeTasks = taskList.filter((t) => isRefreshingStatus(t.status));
   const hasActiveTasks = activeTasks.length > 0;
 
   // 没有任务时不显示浮窗
@@ -279,7 +318,7 @@ export const FloatingTaskPanel: React.FC<FloatingTaskPanelProps> = ({
                         </div>
                       )}
 
-                      {(task.status === 'running' || task.status === 'pending') && (
+                      {isRefreshingStatus(task.status) && (
                         <Progress
                           percent={task.progress}
                           size="small"
@@ -302,14 +341,38 @@ export const FloatingTaskPanel: React.FC<FloatingTaskPanelProps> = ({
 
                       <div style={{ marginTop: 8 }}>
                         <Space size={4}>
-                          {(task.status === 'running' || task.status === 'pending') && (
+                          {isAutoWritingTask(task) && task.status === 'running' && (
+                            <Popconfirm
+                              title="确认暂停自动写作任务？"
+                              onConfirm={() => handlePauseTask(task)}
+                              okText="确认"
+                              cancelText="取消"
+                            >
+                              <Button size="small" icon={<PauseCircleOutlined />}>
+                                暂停
+                              </Button>
+                            </Popconfirm>
+                          )}
+                          {isAutoWritingTask(task) && task.status === 'paused' && (
+                            <Popconfirm
+                              title="确认恢复自动写作任务？"
+                              onConfirm={() => handleResumeTask(task)}
+                              okText="确认"
+                              cancelText="取消"
+                            >
+                              <Button size="small" icon={<PlayCircleOutlined />}>
+                                恢复
+                              </Button>
+                            </Popconfirm>
+                          )}
+                          {(task.status === 'running' || task.status === 'pending' || task.status === 'paused') && (
                             <Popconfirm
                               title="确认取消任务？"
                               onConfirm={() => handleCancelTask(task)}
                               okText="确认"
                               cancelText="取消"
                             >
-                              <Button size="small" danger>
+                              <Button size="small" danger icon={<StopOutlined />}>
                                 取消
                               </Button>
                             </Popconfirm>
