@@ -59,6 +59,9 @@ import type {
   BatchAnalysisStatusResponse,
   BatchAnalyzeUnanalyzedRequest,
   BatchAnalyzeUnanalyzedResponse,
+  AutoWritingStartRequest,
+  AutoWritingStartResponse,
+  AutoWritingTaskDetail,
 } from '../types';
 
 interface MCPPluginSimpleCreate {
@@ -506,6 +509,20 @@ export const bookImportApi = {
 
   cancelTask: (taskId: string) =>
     api.delete<unknown, { success: boolean; message: string }>(`/book-import/tasks/${taskId}`),
+};
+
+export const autoWritingApi = {
+  start: (data: AutoWritingStartRequest) =>
+    api.post<unknown, AutoWritingStartResponse>('/auto-writing/start', data),
+
+  getTask: (taskId: string) =>
+    api.get<unknown, AutoWritingTaskDetail>(`/auto-writing/${taskId}`),
+
+  pause: (taskId: string) =>
+    api.post<unknown, AutoWritingTaskDetail>(`/auto-writing/${taskId}/pause`, {}),
+
+  cancel: (taskId: string) =>
+    api.post<unknown, AutoWritingTaskDetail>(`/auto-writing/${taskId}/cancel`, {}),
 };
 
 export const outlineApi = {

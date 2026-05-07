@@ -157,6 +157,8 @@ export const FloatingTaskPanel: React.FC<FloatingTaskPanelProps> = ({
         return '章节生成';
       case 'chapter_batch':
         return '批量章节生成';
+      case 'auto_writing':
+        return '自动写作';
       case 'wizard':
         return '向导创建';
       default:

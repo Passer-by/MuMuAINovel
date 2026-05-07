@@ -5,6 +5,7 @@ import Inspiration from './pages/Inspiration';
 import ProjectDetail from './pages/ProjectDetail';
 import WorldSetting from './pages/WorldSetting';
 import Outline from './pages/Outline';
+import AutoWriting from './pages/AutoWriting';
 import Characters from './pages/Characters';
 import Careers from './pages/Careers';
 import Relationships from './pages/Relationships';
@@ -58,6 +59,7 @@ function App() {
             <Route path="world-setting" element={<WorldSetting />} />
             <Route path="careers" element={<Careers />} />
             <Route path="outline" element={<Outline />} />
+            <Route path="auto-writing" element={<AutoWriting />} />
             <Route path="characters" element={<Characters />} />
             <Route path="relationships" element={<Relationships />} />
             <Route path="relationships-graph" element={<RelationshipGraph />} />

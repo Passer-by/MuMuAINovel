@@ -19,6 +19,7 @@ import {
   BulbOutlined,
   CloudOutlined,
   MoonOutlined,
+  RocketOutlined,
 } from '@ant-design/icons';
 import { useStore } from '../store';
 import { useCharacterSync, useOutlineSync, useChapterSync } from '../store/hooks';
@@ -154,6 +155,11 @@ export default function ProjectDetail() {
           label: <Link to={`/project/${projectId}/outline`}>大纲管理</Link>,
         },
         {
+          key: 'auto-writing',
+          icon: <RocketOutlined />,
+          label: <Link to={`/project/${projectId}/auto-writing`}>自动写作</Link>,
+        },
+        {
           key: 'chapters',
           icon: <BookOutlined />,
           label: <Link to={`/project/${projectId}/chapters`}>章节管理</Link>,
@@ -225,6 +231,11 @@ export default function ProjectDetail() {
       label: <Link to={`/project/${projectId}/outline`}>大纲管理</Link>,
     },
     {
+      key: 'auto-writing',
+      icon: <RocketOutlined />,
+      label: <Link to={`/project/${projectId}/auto-writing`}>自动写作</Link>,
+    },
+    {
       key: 'chapters',
       icon: <BookOutlined />,
       label: <Link to={`/project/${projectId}/chapters`}>章节管理</Link>,
@@ -259,6 +270,7 @@ export default function ProjectDetail() {
     if (path.includes('/relationships')) return 'relationships';
     if (path.includes('/organizations')) return 'organizations';
     if (path.includes('/outline')) return 'outline';
+    if (path.includes('/auto-writing')) return 'auto-writing';
     if (path.includes('/characters')) return 'characters';
     if (path.includes('/chapter-analysis')) return 'chapter-analysis';
     if (path.includes('/foreshadows')) return 'foreshadows';

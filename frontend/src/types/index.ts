@@ -637,6 +637,70 @@ export interface BatchAnalyzeUnanalyzedResponse {
   started_tasks: Record<string, AnalysisTask>;
 }
 
+// 自动写作
+export type AutoWritingMode = 'existing_project' | 'new_idea';
+
+export interface AutoWritingQualityConfig {
+  overall_threshold: number;
+  coherence_threshold: number;
+  pacing_threshold?: number;
+  engagement_threshold?: number;
+  max_quality_retries: number;
+  consecutive_quality_failure_limit: number;
+}
+
+export interface AutoWritingStartRequest {
+  mode: AutoWritingMode;
+  project_id?: string;
+  target_total_words: number;
+  chapters_per_batch: number;
+  target_words_per_chapter: number;
+  quality_config: AutoWritingQualityConfig;
+  model?: string;
+  style_id?: number | null;
+  title?: string;
+  description?: string;
+  theme?: string;
+  genre?: string;
+}
+
+export interface AutoWritingStartResponse {
+  task_id: string;
+  project_id: string;
+  status?: string;
+  message?: string;
+}
+
+export interface AutoWritingFailureRecord {
+  chapter_id?: string;
+  chapter_number?: number;
+  title?: string;
+  failing_scores: string[];
+  scores?: Partial<AnalysisScores>;
+  retry_count?: number;
+  message?: string;
+}
+
+export interface AutoWritingTaskDetail {
+  task_id: string;
+  project_id: string;
+  status: 'pending' | 'running' | 'completed' | 'failed' | 'cancelled' | 'paused' | string;
+  progress?: number;
+  status_message?: string | null;
+  task_result?: {
+    quality_failures?: AutoWritingFailureRecord[];
+    generated_chapters?: number;
+    current_words?: number;
+    message?: string;
+    [key: string]: unknown;
+  } | null;
+  error_message?: string | null;
+  created_at?: string | null;
+  started_at?: string | null;
+  completed_at?: string | null;
+  updated_at?: string | null;
+}
+
 // 分析结果 - 钩子
 export interface AnalysisHook {
   type: string;
