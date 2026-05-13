@@ -14,7 +14,7 @@ from app.schemas.auto_writing import (
     AutoWritingTaskDetailResponse,
     AutoWritingTaskResponse,
 )
-from app.services.auto_writing_service import run_auto_writing_background
+from app.services.auto_writing_service import ensure_story_seed_for_auto_writing, run_auto_writing_background
 from app.services.background_task_service import background_task_service
 
 router = APIRouter(prefix="/auto-writing", tags=["自动写作"])
@@ -33,13 +33,16 @@ async def start_auto_writing_task(
 
     if payload.mode == "existing_project":
         project = await verify_project_access(payload.project_id, user_id, db)
+        task_input = payload.model_dump()
     else:
+        task_input = payload.model_dump()
+        story_seed = ensure_story_seed_for_auto_writing(task_input)
         project = Project(
             user_id=user_id,
-            title=payload.title,
-            description=payload.description,
-            theme=payload.theme,
-            genre=payload.genre,
+            title=story_seed["title"],
+            description=story_seed["description"],
+            theme=story_seed["theme"],
+            genre=story_seed["genre"],
             target_words=payload.target_total_words,
             status="writing",
             wizard_status="completed",
@@ -62,7 +65,6 @@ async def start_auto_writing_task(
     if active_task:
         raise HTTPException(status_code=400, detail="该项目已有自动写作任务正在运行")
 
-    task_input = payload.model_dump()
     task_input["project_id"] = project.id
     task = await background_task_service.create_task(
         user_id=user_id,

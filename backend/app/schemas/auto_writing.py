@@ -71,12 +71,22 @@ class AutoWritingStartRequest(BaseModel):
     )
     automation_policy: AutoWritingAutomationPolicy = Field(default_factory=AutoWritingAutomationPolicy)
 
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_blank_story_fields(cls, data):
+        if isinstance(data, dict):
+            normalized = dict(data)
+            for field in ("title", "description", "theme", "genre"):
+                value = normalized.get(field)
+                if isinstance(value, str) and not value.strip():
+                    normalized[field] = None
+            return normalized
+        return data
+
     @model_validator(mode="after")
     def validate_mode_inputs(self):
         if self.mode == "existing_project" and not self.project_id:
             raise ValueError("existing_project 模式必须提供 project_id")
-        if self.mode == "new_idea" and not self.title:
-            raise ValueError("new_idea 模式必须提供 title")
         return self
 
 

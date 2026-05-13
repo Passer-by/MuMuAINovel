@@ -9,12 +9,14 @@ from app.services.auto_writing_service import (
     QualityGateConfig,
     QualityGateResult,
     QualityScores,
+    build_default_story_seed,
     build_auto_writing_report,
     build_auto_writing_planning_prompt,
     build_consistency_guard_instruction,
     build_enhanced_quality_failure_record,
     build_model_attempt_sequence,
     build_volume_planning_instruction,
+    ensure_story_seed_for_auto_writing,
     format_project_chapters_for_export,
     safe_export_path_segment,
     build_seed_chapter_plans_from_idea,
@@ -221,6 +223,74 @@ def test_start_request_accepts_automation_policy_config():
     assert request.automation_policy.auto_export_enabled is True
     assert request.automation_policy.budget_token_limit == 200000
     assert request.automation_policy.fallback_models == "model-a,model-b"
+
+
+def test_start_request_allows_new_idea_without_title_or_description():
+    request = AutoWritingStartRequest.model_validate(
+        {
+            "mode": "new_idea",
+            "target_total_words": 50000,
+            "chapters_per_batch": 3,
+            "target_words_per_chapter": 3000,
+        }
+    )
+
+    assert request.mode == "new_idea"
+    assert request.title is None
+    assert request.description is None
+
+
+def test_start_request_coerces_blank_new_idea_fields_to_none():
+    request = AutoWritingStartRequest.model_validate(
+        {
+            "mode": "new_idea",
+            "title": "",
+            "description": "  ",
+            "theme": "",
+            "genre": "",
+            "target_total_words": 50000,
+            "chapters_per_batch": 3,
+            "target_words_per_chapter": 3000,
+        }
+    )
+
+    assert request.title is None
+    assert request.description is None
+    assert request.theme is None
+    assert request.genre is None
+
+
+def test_build_default_story_seed_uses_optional_genre_hint():
+    seed = build_default_story_seed({"genre": "都市"})
+
+    assert seed["title"]
+    assert seed["genre"] == "都市"
+    assert seed["theme"]
+    assert seed["description"]
+    assert seed["source"] == "fallback"
+
+
+def test_build_default_story_seed_allows_empty_genre_to_randomize_with_injected_choice():
+    seed = build_default_story_seed({}, chooser=lambda genres: "科幻")
+
+    assert seed["genre"] == "科幻"
+    assert seed["title"] == "星门回声"
+
+
+def test_ensure_story_seed_preserves_user_idea_and_fills_missing_fields():
+    task_input = {
+        "genre": "科幻",
+        "description": "一艘世代飞船收到来自地球旧纪元的求救信号。",
+    }
+
+    seed = ensure_story_seed_for_auto_writing(task_input)
+
+    assert seed["title"]
+    assert seed["genre"] == "科幻"
+    assert seed["description"] == task_input["description"]
+    assert seed["theme"]
+    assert task_input["title"] == seed["title"]
+    assert task_input["auto_generated_story_seed"] == seed
 
 
 def test_build_seed_chapter_plans_from_idea_uses_story_setup():
@@ -491,6 +561,7 @@ def test_build_auto_writing_report_collects_run_metrics():
         current_words=24000,
         target_total_words=30000,
         token_usage={"estimated_total": 100000},
+        story_seed={"title": "星门回声", "genre": "科幻", "source": "fallback"},
     )
 
     assert report["generated_chapters"] == 8
@@ -498,6 +569,8 @@ def test_build_auto_writing_report_collects_run_metrics():
     assert report["auto_recover"] is True
     assert report["completion_ratio"] == 0.8
     assert report["token_usage"]["estimated_total"] == 100000
+    assert report["story_seed"]["title"] == "星门回声"
+    assert report["story_seed"]["source"] == "fallback"
 
 
 def test_build_model_attempt_sequence_uses_primary_then_unique_fallbacks():

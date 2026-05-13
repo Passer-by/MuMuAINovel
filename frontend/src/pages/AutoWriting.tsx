@@ -195,7 +195,7 @@ export default function AutoWriting() {
           </Space>
           <Text type="secondary">
             {isNewIdeaMode
-              ? '从一个标题或灵感开始，自动创建项目、大纲草稿并进入章节生成。'
+              ? '可以只提供题材或灵感，也可以全留空，让系统自动生成故事创意并进入章节生成。'
               : `当前项目：${currentProject?.title || projectId}`}
           </Text>
         </div>
@@ -261,33 +261,38 @@ export default function AutoWriting() {
           {isNewIdeaMode && (
             <>
               <Divider orientation="left" plain>故事设定</Divider>
+              <Alert
+                type="info"
+                showIcon
+                style={{ marginBottom: 16 }}
+                message="故事设定可选"
+                description="只填题材时会围绕题材自动扩展；全部留空时会随机生成标题、主题、简介和初始故事方向。"
+              />
               <Row gutter={16}>
                 <Col xs={24} md={12}>
                   <Form.Item
-                    label="作品标题"
+                    label="作品标题（可选）"
                     name="title"
-                    rules={[{ required: true, message: '请输入作品标题' }]}
                   >
-                    <Input placeholder="例如：星海旧约" maxLength={200} />
+                    <Input placeholder="留空则自动生成，例如：星海旧约" maxLength={200} />
                   </Form.Item>
                 </Col>
                 <Col xs={24} md={12}>
-                  <Form.Item label="类型" name="genre">
-                    <Input placeholder="例如：科幻、都市、玄幻" maxLength={50} />
+                  <Form.Item label="类型 / 题材（可选）" name="genre">
+                    <Input placeholder="例如：科幻、都市、玄幻；留空则随机" maxLength={50} />
                   </Form.Item>
                 </Col>
               </Row>
-              <Form.Item label="主题" name="theme">
-                <Input placeholder="例如：信任与牺牲、成长与逆袭" />
+              <Form.Item label="主题（可选）" name="theme">
+                <Input placeholder="例如：信任与牺牲、成长与逆袭；留空则自动生成" />
               </Form.Item>
               <Form.Item
-                label="灵感描述"
+                label="灵感描述（可选）"
                 name="description"
-                rules={[{ required: true, message: '请输入灵感描述' }]}
               >
                 <Input.TextArea
                   rows={5}
-                  placeholder="输入核心创意、主角处境、冲突或你希望保留的设定。"
+                  placeholder="可以输入核心创意、主角处境、冲突或你希望保留的设定；不填则全自动生成。"
                   showCount
                   maxLength={2000}
                 />

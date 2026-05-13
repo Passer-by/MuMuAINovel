@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import asyncio
 import re
+import random
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -32,6 +33,39 @@ logger = get_logger(__name__)
 
 AUTO_WRITING_EXPORT_STORAGE_DIR = PROJECT_ROOT / "storage" / "auto_writing_exports"
 AUTO_WRITING_EXPORT_PUBLIC_PREFIX = "/generated-assets/auto-writing"
+
+DEFAULT_STORY_SEEDS = {
+    "玄幻": {
+        "title": "天命余烬",
+        "theme": "逆境成长与命运抗争",
+        "description": "被宗门放逐的少年在禁地捡到一枚沉睡古印，却发现自己的废脉正是开启旧时代传承的钥匙。",
+    },
+    "都市": {
+        "title": "逆光合伙人",
+        "theme": "底层逆袭与信任重建",
+        "description": "负债累累的普通青年偶然获得预测商业风险的能力，被迫在资本围猎和旧友背叛中重建人生。",
+    },
+    "科幻": {
+        "title": "星门回声",
+        "theme": "文明存续与个人选择",
+        "description": "深空勘探员收到来自未来的求救信号，信号指向人类即将主动打开的一座失控星门。",
+    },
+    "悬疑": {
+        "title": "第七份遗嘱",
+        "theme": "真相、欲望与身份迷局",
+        "description": "一名档案修复师收到不存在死者的遗嘱，调查中发现每个继承人都在隐藏同一场旧案。",
+    },
+    "末世": {
+        "title": "零点避难所",
+        "theme": "秩序崩塌下的守护与抉择",
+        "description": "灾变倒计时归零后，临时避难所的管理员发现自己掌握着决定城市幸存者去向的黑箱权限。",
+    },
+    "通用": {
+        "title": "命运回廊",
+        "theme": "成长、选择与代价",
+        "description": "主角在一次意外中踏入改变命运的关键事件，必须在亲情、理想和现实压力之间做出选择。",
+    },
+}
 
 
 @dataclass(frozen=True)
@@ -464,12 +498,13 @@ def build_auto_writing_report(
     current_words: int,
     target_total_words: Optional[int],
     token_usage: Optional[Dict[str, Any]] = None,
+    story_seed: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """构造任务面板可读的自动写作运行报告。"""
     completion_ratio = None
     if target_total_words:
         completion_ratio = round(min(max(current_words / max(target_total_words, 1), 0.0), 1.0), 4)
-    return {
+    report = {
         "generated_chapters": generated_chapters,
         "quality_failure_count": len(quality_failures or []),
         "auto_recover": policy.auto_recover,
@@ -480,6 +515,29 @@ def build_auto_writing_report(
         "token_usage": token_usage or {},
         "updated_at": datetime.now().isoformat(),
     }
+    if story_seed:
+        report["story_seed"] = story_seed
+    return report
+
+
+def build_auto_writing_report_from_task_input(
+    task_input: Dict[str, Any],
+    generated_chapters: int,
+    quality_failures: List[Dict[str, Any]],
+    policy: AutoWritingPolicy,
+    current_words: int,
+    token_usage: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """从任务输入构造报告，自动携带无想法模式生成的故事种子。"""
+    return build_auto_writing_report(
+        generated_chapters=generated_chapters,
+        quality_failures=quality_failures,
+        policy=policy,
+        current_words=current_words,
+        target_total_words=task_input.get("target_total_words"),
+        token_usage=token_usage,
+        story_seed=task_input.get("auto_generated_story_seed"),
+    )
 
 
 async def _export_project_chapters_for_auto_writing(
@@ -637,11 +695,53 @@ def _record_chapter_result(
     return results[-200:]
 
 
+def _pick_story_seed_genre(raw_genre: Any, chooser: Optional[Any] = None) -> str:
+    genre = _coerce_text(raw_genre, "通用")
+    if raw_genre is None or not str(raw_genre).strip():
+        candidates = [item for item in DEFAULT_STORY_SEEDS if item != "通用"]
+        picker = chooser or random.choice
+        picked = picker(candidates)
+        return picked if picked in DEFAULT_STORY_SEEDS else "通用"
+    return genre if genre in DEFAULT_STORY_SEEDS else "通用"
+
+
+def build_default_story_seed(task_input: Dict[str, Any], chooser: Optional[Any] = None) -> Dict[str, Any]:
+    """在用户不提供想法时生成可继续自动写作的本地兜底创意种子。"""
+    genre = _pick_story_seed_genre((task_input or {}).get("genre"), chooser=chooser)
+    template = DEFAULT_STORY_SEEDS[genre]
+    return {
+        "title": template["title"],
+        "genre": genre,
+        "theme": template["theme"],
+        "description": template["description"],
+        "source": "fallback",
+    }
+
+
+def ensure_story_seed_for_auto_writing(task_input: Dict[str, Any]) -> Dict[str, Any]:
+    """补齐新想法自动写作所需的标题、题材、主题和简介。"""
+    seed = build_default_story_seed(task_input)
+    seed["title"] = _coerce_text(task_input.get("title"), seed["title"])
+    seed["genre"] = _coerce_text(task_input.get("genre"), seed["genre"])
+    seed["theme"] = _coerce_text(task_input.get("theme"), seed["theme"])
+    seed["description"] = _coerce_text(task_input.get("description"), seed["description"])
+    if all(_coerce_text(task_input.get(key)) for key in ("title", "genre", "theme", "description")):
+        seed["source"] = "user"
+
+    task_input["title"] = seed["title"]
+    task_input["genre"] = seed["genre"]
+    task_input["theme"] = seed["theme"]
+    task_input["description"] = seed["description"]
+    task_input["auto_generated_story_seed"] = seed
+    return seed
+
+
 def build_seed_chapter_plans_from_idea(task_input: Dict[str, Any], chapter_count: int) -> List[Dict[str, Any]]:
     """根据新想法输入生成可落库的初始章节草稿计划。"""
     if chapter_count <= 0:
         return []
 
+    ensure_story_seed_for_auto_writing(task_input)
     title = (task_input.get("title") or "未命名作品").strip()
     description = (task_input.get("description") or "围绕主角的核心选择与冲突展开。").strip()
     theme = (task_input.get("theme") or "成长与选择").strip()
@@ -708,6 +808,7 @@ def calculate_seed_chapter_count(task_input: Dict[str, Any], cap: int = 200) -> 
 
 def build_auto_writing_planning_prompt(task_input: Dict[str, Any], chapter_count: int) -> str:
     """构建新想法自动写作的一次性规划提示词。"""
+    ensure_story_seed_for_auto_writing(task_input)
     title = task_input.get("title") or "未命名作品"
     description = task_input.get("description") or "暂无简介"
     theme = task_input.get("theme") or "成长与选择"
@@ -989,6 +1090,8 @@ async def run_auto_writing_background(task_id: str, user_id: str) -> None:
             await tracker.start("开始自动写作...")
 
             task_input = task.task_input or {}
+            if task_input.get("mode", "existing_project") == "new_idea":
+                ensure_story_seed_for_auto_writing(task_input)
             project = await db.get(Project, task.project_id)
             if not project:
                 await _mark_task_failed(db, task, "项目不存在")
@@ -1279,12 +1382,12 @@ async def _run_existing_project_batch(
         max_chapters=task_input.get("max_chapters"),
         current_chapter_count=starting_generated_count,
     ):
-        run_report = build_auto_writing_report(
+        run_report = build_auto_writing_report_from_task_input(
+            task_input=task_input,
             generated_chapters=starting_generated_count,
             quality_failures=existing_quality_failures or [],
             policy=policy,
             current_words=project.current_words or 0,
-            target_total_words=task_input.get("target_total_words"),
         )
         if policy.auto_export_enabled:
             try:
@@ -1346,12 +1449,12 @@ async def _run_existing_project_batch(
                     "quality_failures": existing_quality_failures or [],
                     "chapter_results": chapter_results,
                     "consistency_ledger": consistency_ledger,
-                    "run_report": build_auto_writing_report(
+                    "run_report": build_auto_writing_report_from_task_input(
+                        task_input=task_input,
                         generated_chapters=starting_generated_count,
                         quality_failures=existing_quality_failures or [],
                         policy=policy,
                         current_words=project.current_words or 0,
-                        target_total_words=task_input.get("target_total_words"),
                     ),
                 },
             )
@@ -1506,12 +1609,12 @@ async def _run_existing_project_batch(
                             "consecutive_failures": consecutive_failures,
                             "updated_at": datetime.now().isoformat(),
                         },
-                        "run_report": build_auto_writing_report(
+                        "run_report": build_auto_writing_report_from_task_input(
+                            task_input=task_input,
                             generated_chapters=starting_generated_count + generated_count,
                             quality_failures=quality_failures,
                             policy=policy,
                             current_words=project.current_words or 0,
-                            target_total_words=task_input.get("target_total_words"),
                         ),
                     })
                     await _mark_task_failed(db, task, f"第 {chapter.chapter_number} 章生成失败: {last_generation_error}")
@@ -1580,12 +1683,12 @@ async def _run_existing_project_batch(
                         "consecutive_failures": consecutive_failures,
                         "updated_at": datetime.now().isoformat(),
                     },
-                    "run_report": build_auto_writing_report(
+                    "run_report": build_auto_writing_report_from_task_input(
+                        task_input=task_input,
                         generated_chapters=starting_generated_count + generated_count,
                         quality_failures=quality_failures,
                         policy=policy,
                         current_words=project.current_words or 0,
-                        target_total_words=task_input.get("target_total_words"),
                     ),
                 })
                 await _mark_task_failed(db, task, f"第 {chapter.chapter_number} 章生成失败")
@@ -1633,12 +1736,12 @@ async def _run_existing_project_batch(
                     "consecutive_failures": consecutive_failures,
                     "updated_at": datetime.now().isoformat(),
                 },
-                "run_report": build_auto_writing_report(
+                "run_report": build_auto_writing_report_from_task_input(
+                    task_input=task_input,
                     generated_chapters=starting_generated_count + generated_count,
                     quality_failures=quality_failures,
                     policy=policy,
                     current_words=project.current_words or 0,
-                    target_total_words=task_input.get("target_total_words"),
                 ),
             })
             await db.commit()
@@ -1756,12 +1859,12 @@ async def _run_existing_project_batch(
                         "consecutive_failures": consecutive_failures,
                         "updated_at": datetime.now().isoformat(),
                     },
-                    "run_report": build_auto_writing_report(
+                    "run_report": build_auto_writing_report_from_task_input(
+                        task_input=task_input,
                         generated_chapters=starting_generated_count + generated_count,
                         quality_failures=quality_failures,
                         policy=policy,
                         current_words=project.current_words or 0,
-                        target_total_words=task_input.get("target_total_words"),
                     ),
                 })
                 await _mark_task_failed(db, task, f"第 {chapter.chapter_number} 章质量未达标")
@@ -1795,12 +1898,12 @@ async def _run_existing_project_batch(
                         "consecutive_failures": consecutive_failures,
                         "updated_at": datetime.now().isoformat(),
                     },
-                    "run_report": build_auto_writing_report(
+                    "run_report": build_auto_writing_report_from_task_input(
+                        task_input=task_input,
                         generated_chapters=starting_generated_count + generated_count,
                         quality_failures=quality_failures,
                         policy=policy,
                         current_words=project.current_words or 0,
-                        target_total_words=task_input.get("target_total_words"),
                     ),
                 })
                 await db.commit()
@@ -1853,12 +1956,12 @@ async def _run_existing_project_batch(
                 "consecutive_failures": consecutive_failures,
                 "updated_at": datetime.now().isoformat(),
             },
-            "run_report": build_auto_writing_report(
+            "run_report": build_auto_writing_report_from_task_input(
+                task_input=task_input,
                 generated_chapters=starting_generated_count + generated_count,
                 quality_failures=quality_failures,
                 policy=policy,
                 current_words=project.current_words or 0,
-                target_total_words=task_input.get("target_total_words"),
                 token_usage={
                     "estimated_total": int((project.current_words or 0) * 2),
                     "budget_token_limit": policy.budget_token_limit,
