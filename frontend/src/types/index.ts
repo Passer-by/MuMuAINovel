@@ -639,30 +639,51 @@ export interface BatchAnalyzeUnanalyzedResponse {
 
 // 自动写作
 export type AutoWritingMode = 'existing_project' | 'new_idea';
+export type OutlineMode = 'one-to-one' | 'one-to-many';
+export type AutoWritingFailureStrategy = 'repair_and_continue' | 'pause' | 'skip_chapter' | 'fail';
 
 export interface AutoWritingQualityConfig {
   overall_threshold: number;
   coherence_threshold: number;
-  pacing_threshold?: number;
-  engagement_threshold?: number;
+  pacing_threshold?: number | null;
+  engagement_threshold?: number | null;
   max_quality_retries: number;
   consecutive_quality_failure_limit: number;
+}
+
+export interface AutoWritingAutomationPolicy {
+  auto_expand_outline: boolean;
+  auto_recover: boolean;
+  failure_strategy: AutoWritingFailureStrategy;
+  max_operation_retries: number;
+  retry_backoff_seconds: number;
+  min_word_ratio: number;
+  repetition_check_chars: number;
+  max_repetition_ratio: number;
+  require_chapter_hook: boolean;
+  consistency_check_enabled: boolean;
+  volume_planning_enabled: boolean;
+  auto_export_enabled: boolean;
+  budget_token_limit?: number | null;
+  fallback_models?: string | string[];
 }
 
 export interface AutoWritingStartRequest {
   mode: AutoWritingMode;
   project_id?: string;
   target_total_words: number;
+  max_chapters?: number | null;
   chapters_per_batch: number;
   target_words_per_chapter: number;
   quality_config: AutoWritingQualityConfig;
+  automation_policy?: AutoWritingAutomationPolicy;
   model?: string;
   style_id?: number | null;
   title?: string;
   description?: string;
   theme?: string;
   genre?: string;
-  outline_mode?: 'one-to-one' | 'one-to-many';
+  outline_mode?: OutlineMode;
 }
 
 export interface AutoWritingStartResponse {
@@ -682,6 +703,72 @@ export interface AutoWritingFailureRecord {
   scores?: Partial<AnalysisScores>;
   retry_count?: number;
   message?: string;
+  validation_failures?: string[];
+  action?: string;
+  created_at?: string;
+}
+
+export interface AutoWritingCheckpoint {
+  stage?: string;
+  message?: string;
+  generated_chapters?: number;
+  quality_failure_count?: number;
+  current_chapter_number?: number;
+  retry_count?: number;
+  [key: string]: unknown;
+}
+
+export interface AutoWritingChapterResult {
+  chapter_id?: string;
+  chapter_number?: number;
+  title?: string;
+  status?: string;
+  word_count?: number;
+  retry_count?: number;
+  failing_scores?: string[];
+  validation_failures?: string[];
+  [key: string]: unknown;
+}
+
+export interface AutoWritingRunReport {
+  generated_chapters?: number;
+  quality_failure_count?: number;
+  auto_recover?: boolean;
+  failure_strategy?: AutoWritingFailureStrategy | string;
+  completion_ratio?: number | null;
+  current_words?: number;
+  target_total_words?: number | null;
+  token_usage?: {
+    estimated_total?: number;
+    prompt_tokens?: number;
+    completion_tokens?: number;
+    total_tokens?: number;
+    [key: string]: unknown;
+  };
+  export?: {
+    filename?: string;
+    path?: string;
+    url?: string;
+    chapter_count?: number;
+    size?: number;
+    created_at?: string;
+    [key: string]: unknown;
+  };
+  export_error?: string;
+  updated_at?: string;
+  [key: string]: unknown;
+}
+
+export interface AutoWritingTaskResult {
+  quality_failures?: AutoWritingFailureRecord[];
+  generated_chapters?: number;
+  current_words?: number;
+  completion_ratio?: number | null;
+  checkpoint?: AutoWritingCheckpoint;
+  chapter_results?: AutoWritingChapterResult[];
+  run_report?: AutoWritingRunReport;
+  message?: string;
+  [key: string]: unknown;
 }
 
 export interface AutoWritingTaskDetail {
@@ -690,13 +777,7 @@ export interface AutoWritingTaskDetail {
   status: BackgroundTaskStatusValue | string;
   progress?: number;
   status_message?: string | null;
-  task_result?: {
-    quality_failures?: AutoWritingFailureRecord[];
-    generated_chapters?: number;
-    current_words?: number;
-    message?: string;
-    [key: string]: unknown;
-  } | null;
+  task_result?: AutoWritingTaskResult | null;
   error_message?: string | null;
   created_at?: string | null;
   started_at?: string | null;

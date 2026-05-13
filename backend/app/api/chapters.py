@@ -3418,6 +3418,7 @@ async def generate_single_chapter_for_batch(
     write_lock: Lock,
     custom_model: Optional[str] = None,
     previous_summary_context: Optional[str] = None,
+    custom_instructions: Optional[str] = None,
     should_stop: Optional[Callable[[], Awaitable[bool]]] = None
 ) -> Optional[str]:
     """
@@ -3597,6 +3598,11 @@ async def generate_single_chapter_for_batch(
         prompt = WritingStyleManager.apply_style_to_prompt(base_prompt, style_content)
     else:
         prompt = base_prompt
+    if custom_instructions and custom_instructions.strip():
+        prompt = f"""{prompt}
+
+【自动写作额外约束】
+{custom_instructions.strip()}"""
     
     # 🎨 方案一：将写作风格注入到系统提示词（批量生成）
     system_prompt_with_style = None

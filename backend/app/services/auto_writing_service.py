@@ -3,14 +3,18 @@ from __future__ import annotations
 
 import json
 import asyncio
+import re
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
+from urllib.parse import quote
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.database import get_engine
+from app.config import PROJECT_ROOT
 from app.logger import get_logger
 from app.models.analysis_task import AnalysisTask
 from app.models.background_task import BackgroundTask
@@ -25,6 +29,9 @@ from app.schemas.regeneration import ChapterRegenerateRequest, PreserveElementsC
 from app.services.background_task_service import TaskProgressTracker
 
 logger = get_logger(__name__)
+
+AUTO_WRITING_EXPORT_STORAGE_DIR = PROJECT_ROOT / "storage" / "auto_writing_exports"
+AUTO_WRITING_EXPORT_PUBLIC_PREFIX = "/generated-assets/auto-writing"
 
 
 @dataclass(frozen=True)
@@ -47,6 +54,35 @@ class QualityScores:
 class QualityGateResult:
     passed: bool
     failing_scores: List[str]
+
+
+@dataclass(frozen=True)
+class AutoWritingPolicy:
+    auto_expand_outline: bool = True
+    auto_recover: bool = True
+    failure_strategy: str = "repair_and_continue"
+    max_operation_retries: int = 3
+    retry_backoff_seconds: int = 10
+    min_word_ratio: float = 0.8
+    repetition_check_chars: int = 800
+    max_repetition_ratio: float = 0.6
+    require_chapter_hook: bool = False
+    consistency_check_enabled: bool = True
+    volume_planning_enabled: bool = True
+    auto_export_enabled: bool = False
+    budget_token_limit: Optional[int] = None
+    fallback_models: List[str] = None
+
+    def __post_init__(self):
+        if self.fallback_models is None:
+            object.__setattr__(self, "fallback_models", [])
+
+
+@dataclass(frozen=True)
+class ChapterQualityValidationResult:
+    passed: bool
+    failing_checks: List[str]
+    metrics: Dict[str, Any]
 
 
 def evaluate_quality_gate(
@@ -86,18 +122,237 @@ def should_continue_writing(
 
 def select_chapters_for_batch(chapters: Iterable[Any], chapters_per_batch: int) -> List[Any]:
     """选择草稿或无内容章节，按章节序号排序并限制批次大小。"""
+    terminal_statuses = {"skipped", "failed", "cancelled"}
     candidates = [
         chapter for chapter in chapters
-        if getattr(chapter, "status", None) == "draft"
-        or not (getattr(chapter, "content", None) or "").strip()
+        if getattr(chapter, "status", None) not in terminal_statuses
+        and (
+            getattr(chapter, "status", None) == "draft"
+            or not (getattr(chapter, "content", None) or "").strip()
+        )
     ]
     candidates.sort(key=lambda chapter: getattr(chapter, "chapter_number", 0))
     return candidates[:max(chapters_per_batch, 0)]
 
 
+def build_model_attempt_sequence(primary_model: Optional[str], fallback_models: List[str]) -> List[Optional[str]]:
+    """生成模型尝试顺序：主模型优先，备用模型去重。"""
+    attempts: List[Optional[str]] = []
+    if primary_model and str(primary_model).strip():
+        attempts.append(str(primary_model).strip())
+    for model in fallback_models or []:
+        clean = str(model).strip()
+        if clean and clean not in attempts:
+            attempts.append(clean)
+    return attempts or [None]
+
+
+def safe_export_path_segment(value: str) -> str:
+    """生成不会产生路径逃逸的存储目录名。"""
+    clean = re.sub(r"[^A-Za-z0-9_-]", "_", value or "")
+    return clean or "unknown"
+
+
+def format_project_chapters_for_export(project: Any, chapters: Iterable[Any]) -> Dict[str, str]:
+    """按拆书导入友好的 TXT 格式格式化项目章节。"""
+    txt_content: List[str] = []
+    chapter_list = list(chapters)
+    for index, chapter in enumerate(chapter_list):
+        chapter_number = getattr(chapter, "chapter_number", index + 1)
+        chapter_title = (getattr(chapter, "title", "") or "").strip() or f"未命名章节{chapter_number}"
+        raw_content = (getattr(chapter, "content", "") or "").strip()
+        if raw_content:
+            formatted_lines = []
+            for line in raw_content.splitlines():
+                stripped_line = line.strip()
+                if stripped_line:
+                    formatted_lines.append(f"　　{stripped_line}")
+                else:
+                    formatted_lines.append("")
+            chapter_content = "\n".join(formatted_lines)
+        else:
+            chapter_content = "　　（本章暂无内容）"
+
+        txt_content.append(f"第{chapter_number}章 {chapter_title}")
+        txt_content.append(chapter_content)
+        if index < len(chapter_list) - 1:
+            txt_content.append("")
+
+    safe_title = "".join(
+        c for c in (getattr(project, "title", None) or "未命名项目")
+        if c.isalnum() or c in (" ", "-", "_", "，", "。", "、")
+    ).strip() or "未命名项目"
+    return {
+        "filename": f"{safe_title}.txt",
+        "content": "\n".join(txt_content),
+    }
+
+
 def should_pause_for_quality_failures(consecutive_failures: int, limit: int) -> bool:
     """连续质量失败达到阈值时暂停任务。"""
     return limit > 0 and consecutive_failures >= limit
+
+
+def normalize_auto_writing_policy(task_input: Dict[str, Any]) -> AutoWritingPolicy:
+    """归一化无人值守策略配置，兼容前端根级和 automation_policy 两种传法。"""
+    raw = task_input.get("automation_policy") if isinstance(task_input, dict) else None
+    if not isinstance(raw, dict):
+        raw = {}
+
+    def pick(name: str, default: Any) -> Any:
+        if name in raw:
+            return raw[name]
+        if isinstance(task_input, dict) and name in task_input:
+            return task_input[name]
+        return default
+
+    def as_bool(value: Any, default: bool) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on", "启用"}
+        return bool(value)
+
+    def as_int(value: Any, default: int, lower: Optional[int] = None, upper: Optional[int] = None) -> int:
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            number = default
+        if lower is not None:
+            number = max(lower, number)
+        if upper is not None:
+            number = min(upper, number)
+        return number
+
+    def as_float(value: Any, default: float, lower: Optional[float] = None, upper: Optional[float] = None) -> float:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            number = default
+        if lower is not None:
+            number = max(lower, number)
+        if upper is not None:
+            number = min(upper, number)
+        return number
+
+    fallback_models = pick("fallback_models", [])
+    if isinstance(fallback_models, str):
+        fallback_models = [item.strip() for item in fallback_models.split(",") if item.strip()]
+    elif isinstance(fallback_models, list):
+        fallback_models = [str(item).strip() for item in fallback_models if str(item).strip()]
+    else:
+        fallback_models = []
+
+    strategy = str(pick("failure_strategy", "repair_and_continue") or "repair_and_continue")
+    allowed_strategies = {"repair_and_continue", "pause", "skip_chapter", "fail"}
+    if strategy not in allowed_strategies:
+        strategy = "repair_and_continue"
+
+    budget = pick("budget_token_limit", None)
+    budget_token_limit = None
+    if budget not in (None, ""):
+        budget_token_limit = as_int(budget, 0, lower=1)
+
+    return AutoWritingPolicy(
+        auto_expand_outline=as_bool(pick("auto_expand_outline", True), True),
+        auto_recover=as_bool(pick("auto_recover", True), True),
+        failure_strategy=strategy,
+        max_operation_retries=as_int(pick("max_operation_retries", 3), 3, lower=0, upper=20),
+        retry_backoff_seconds=as_int(pick("retry_backoff_seconds", 10), 10, lower=0, upper=3600),
+        min_word_ratio=as_float(pick("min_word_ratio", 0.8), 0.8, lower=0.0, upper=2.0),
+        repetition_check_chars=as_int(pick("repetition_check_chars", 800), 800, lower=0, upper=10000),
+        max_repetition_ratio=as_float(pick("max_repetition_ratio", 0.6), 0.6, lower=0.0, upper=1.0),
+        require_chapter_hook=as_bool(pick("require_chapter_hook", False), False),
+        consistency_check_enabled=as_bool(pick("consistency_check_enabled", True), True),
+        volume_planning_enabled=as_bool(pick("volume_planning_enabled", True), True),
+        auto_export_enabled=as_bool(pick("auto_export_enabled", False), False),
+        budget_token_limit=budget_token_limit,
+        fallback_models=fallback_models,
+    )
+
+
+def _chunk_repetition_ratio(text: str, chunk_size: int = 12) -> float:
+    if len(text) < chunk_size:
+        return 0.0
+    chunks = [text[index:index + chunk_size] for index in range(0, len(text) - chunk_size + 1)]
+    if not chunks:
+        return 0.0
+    return 1.0 - (len(set(chunks)) / len(chunks))
+
+
+def _cross_repetition_ratio(content: str, previous_content_tail: str, chunk_size: int = 12) -> float:
+    if not content or not previous_content_tail or len(content) < chunk_size:
+        return 0.0
+    chunks = [content[index:index + chunk_size] for index in range(0, len(content) - chunk_size + 1)]
+    previous_chunks = {
+        previous_content_tail[index:index + chunk_size]
+        for index in range(0, max(len(previous_content_tail) - chunk_size + 1, 0))
+    }
+    if not chunks or not previous_chunks:
+        return 0.0
+    return sum(1 for chunk in chunks if chunk in previous_chunks) / len(chunks)
+
+
+def _has_chapter_hook(content: str) -> bool:
+    tail = (content or "").strip()[-120:]
+    if not tail:
+        return False
+    hook_markers = [
+        "突然", "下一秒", "就在这时", "没想到", "谁也不知道", "真正", "敲", "响起",
+        "出现", "身后", "门外", "秘密", "真相", "代价", "危机", "追兵", "信号",
+        "？", "?", "！", "!", "……",
+    ]
+    return any(marker in tail for marker in hook_markers)
+
+
+def validate_generated_chapter_quality(
+    content: str,
+    target_word_count: int,
+    policy: AutoWritingPolicy,
+    previous_content_tail: str = "",
+) -> ChapterQualityValidationResult:
+    """用非 AI 的硬约束补强质量门，避免章节过短、重复或没有钩子。"""
+    clean_content = (content or "").strip()
+    word_count = len(clean_content)
+    min_word_count = int(max(target_word_count, 0) * policy.min_word_ratio)
+    sample_size = policy.repetition_check_chars
+    sample = clean_content[:sample_size] if sample_size > 0 else clean_content
+    previous_sample = (previous_content_tail or "")[-sample_size:] if sample_size > 0 else previous_content_tail
+    internal_repetition = _chunk_repetition_ratio(sample)
+    cross_repetition = _cross_repetition_ratio(sample, previous_sample)
+    repetition_ratio = max(internal_repetition, cross_repetition)
+
+    failing_checks: List[str] = []
+    if min_word_count > 0 and word_count < min_word_count:
+        failing_checks.append("word_count")
+    if sample_size > 0 and repetition_ratio > policy.max_repetition_ratio:
+        failing_checks.append("repetition")
+    if policy.require_chapter_hook and not _has_chapter_hook(clean_content):
+        failing_checks.append("chapter_hook")
+
+    return ChapterQualityValidationResult(
+        passed=not failing_checks,
+        failing_checks=failing_checks,
+        metrics={
+            "word_count": word_count,
+            "min_word_count": min_word_count,
+            "repetition_ratio": round(repetition_ratio, 4),
+            "internal_repetition_ratio": round(internal_repetition, 4),
+            "cross_repetition_ratio": round(cross_repetition, 4),
+            "has_chapter_hook": _has_chapter_hook(clean_content),
+        },
+    )
+
+
+def should_pause_for_auto_writing_failure(consecutive_failures: int, policy: AutoWritingPolicy) -> bool:
+    """根据无人值守策略决定失败后是否停下交给用户。"""
+    if policy.failure_strategy == "pause":
+        return consecutive_failures > 0
+    if policy.failure_strategy == "skip_chapter":
+        return False
+    return consecutive_failures > policy.max_operation_retries
 
 
 def build_quality_failure_record(
@@ -120,6 +375,266 @@ def build_quality_failure_record(
         "failing_scores": gate_result.failing_scores,
         "retry_count": retry_count,
     }
+
+
+def build_enhanced_quality_failure_record(
+    chapter_id: str,
+    chapter_number: int,
+    scores: QualityScores,
+    gate_result: QualityGateResult,
+    retry_count: int,
+    validation_failures: Optional[List[str]] = None,
+    action: str = "repair_and_continue",
+    validation_metrics: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """构造包含评分和硬约束校验的质量失败记录。"""
+    record = build_quality_failure_record(
+        chapter_id=chapter_id,
+        chapter_number=chapter_number,
+        scores=scores,
+        gate_result=gate_result,
+        retry_count=retry_count,
+    )
+    record["validation_failures"] = validation_failures or []
+    record["validation_metrics"] = validation_metrics or {}
+    record["action"] = action
+    record["created_at"] = datetime.now().isoformat()
+    return record
+
+
+def build_consistency_guard_instruction(ledger: Dict[str, Any]) -> str:
+    """把长篇一致性账本压缩成可注入生成/重写提示的约束文本。"""
+    if not ledger:
+        return ""
+    recent = ledger.get("recent_chapters") or []
+    open_threads = ledger.get("open_threads") or []
+    character_states = ledger.get("character_states") or {}
+
+    lines = ["【长篇一致性约束】"]
+    if recent:
+        lines.append("最近章节：")
+        for item in recent[-10:]:
+            number = item.get("chapter_number", "?")
+            title = item.get("title") or "未命名"
+            summary = item.get("summary") or ""
+            lines.append(f"- 第{number}章《{title}》：{summary}")
+    if open_threads:
+        lines.append("未解决线索：")
+        for thread in open_threads[-20:]:
+            lines.append(f"- {thread}")
+    if isinstance(character_states, dict) and character_states:
+        lines.append("角色状态：")
+        for name, state in list(character_states.items())[:30]:
+            lines.append(f"- {name}：{state}")
+    lines.append("请保持上述事实连续，不要让人物状态、伏笔和已发生事件互相矛盾。")
+    return "\n".join(lines)
+
+
+def build_volume_planning_instruction(
+    generated_chapters: int,
+    target_total_words: Optional[int],
+    current_words: int,
+) -> str:
+    """生成轻量级卷级/阶段规划约束，避免长篇过早收束或原地打转。"""
+    if not target_total_words:
+        return ""
+    ratio = current_words / max(target_total_words, 1)
+    if ratio < 0.25:
+        phase = "开篇铺设"
+        requirement = "扩大人物目标、主要矛盾和世界规则，不要过早解决核心冲突。"
+    elif ratio < 0.55:
+        phase = "中段升级"
+        requirement = "持续升级外部压力和人物关系变化，安排阶段性胜负与新代价。"
+    elif ratio < 0.8:
+        phase = "后段转折"
+        requirement = "推动关键真相、伏笔回收和主要阵营冲突，不要引入无关支线。"
+    else:
+        phase = "收束冲刺"
+        requirement = "集中处理主线、人物选择和未解决伏笔，为结局或下一卷制造明确方向。"
+    return (
+        f"【长篇阶段规划】当前约第 {generated_chapters + 1} 章，"
+        f"总进度约 {ratio:.0%}，阶段：{phase}。{requirement}"
+    )
+
+
+def build_auto_writing_report(
+    generated_chapters: int,
+    quality_failures: List[Dict[str, Any]],
+    policy: AutoWritingPolicy,
+    current_words: int,
+    target_total_words: Optional[int],
+    token_usage: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """构造任务面板可读的自动写作运行报告。"""
+    completion_ratio = None
+    if target_total_words:
+        completion_ratio = round(min(max(current_words / max(target_total_words, 1), 0.0), 1.0), 4)
+    return {
+        "generated_chapters": generated_chapters,
+        "quality_failure_count": len(quality_failures or []),
+        "auto_recover": policy.auto_recover,
+        "failure_strategy": policy.failure_strategy,
+        "completion_ratio": completion_ratio,
+        "current_words": current_words,
+        "target_total_words": target_total_words,
+        "token_usage": token_usage or {},
+        "updated_at": datetime.now().isoformat(),
+    }
+
+
+async def _export_project_chapters_for_auto_writing(
+    db: AsyncSession,
+    project: Project,
+    user_id: str,
+) -> Dict[str, Any]:
+    """自动写作完成后导出项目章节 TXT，并返回任务报告可展示的信息。"""
+    result = await db.execute(
+        select(Chapter)
+        .where(Chapter.project_id == project.id)
+        .order_by(Chapter.chapter_number)
+    )
+    chapters = list(result.scalars().all())
+    exported = format_project_chapters_for_export(project, chapters)
+
+    storage_root = AUTO_WRITING_EXPORT_STORAGE_DIR.resolve()
+    user_segment = safe_export_path_segment(user_id)
+    user_dir = storage_root / user_segment
+    user_dir.resolve().relative_to(storage_root)
+    user_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+    stem = Path(exported["filename"]).stem or "novel"
+    filename = f"{stem}-{timestamp}.txt"
+    file_path = user_dir / filename
+    file_path.write_text(exported["content"], encoding="utf-8")
+    return {
+        "filename": filename,
+        "path": str(file_path),
+        "url": f"{AUTO_WRITING_EXPORT_PUBLIC_PREFIX}/{quote(user_segment)}/{quote(filename)}",
+        "chapter_count": len(chapters),
+        "size": file_path.stat().st_size,
+        "created_at": datetime.now().isoformat(),
+    }
+
+
+def _merge_task_result(
+    task: BackgroundTask,
+    patch: Dict[str, Any],
+) -> Dict[str, Any]:
+    base = dict(task.task_result or {})
+    for key, value in patch.items():
+        if key in {"quality_failures", "chapter_results", "outline_extensions"}:
+            if value is None:
+                continue
+            base[key] = value
+        elif key == "checkpoint":
+            checkpoint = dict(base.get("checkpoint") or {})
+            checkpoint.update(value or {})
+            base[key] = checkpoint
+        elif key == "consistency_ledger":
+            ledger = dict(base.get("consistency_ledger") or {})
+            ledger.update(value or {})
+            base[key] = ledger
+        else:
+            base[key] = value
+    task.task_result = base
+    return base
+
+
+def _append_limited(items: List[Any], item: Any, limit: int = 200) -> List[Any]:
+    items.append(item)
+    if len(items) > limit:
+        return items[-limit:]
+    return items
+
+
+def _update_consistency_ledger(
+    ledger: Dict[str, Any],
+    chapter: Chapter,
+    analysis: Optional[PlotAnalysis],
+    summary_preview: Optional[str],
+    max_items: int = 200,
+) -> Dict[str, Any]:
+    updated = dict(ledger or {})
+    recent = list(updated.get("recent_chapters") or [])
+    recent = _append_limited(
+        recent,
+        {
+            "chapter_number": chapter.chapter_number,
+            "title": chapter.title,
+            "summary": summary_preview or (chapter.summary or "")[:300],
+        },
+        limit=20,
+    )
+    updated["recent_chapters"] = recent
+
+    open_threads = list(updated.get("open_threads") or [])
+    character_states = dict(updated.get("character_states") or {})
+    if analysis:
+        for hook in analysis.hooks or []:
+            if isinstance(hook, dict):
+                content = hook.get("content") or hook.get("description")
+            else:
+                content = str(hook)
+            if content:
+                open_threads = _append_limited(open_threads, content, limit=max_items)
+        for foreshadow in analysis.foreshadows or []:
+            if not isinstance(foreshadow, dict):
+                continue
+            content = foreshadow.get("content")
+            if not content:
+                continue
+            if foreshadow.get("type") == "resolved":
+                open_threads = [thread for thread in open_threads if thread != content]
+            else:
+                open_threads = _append_limited(open_threads, content, limit=max_items)
+        for state in analysis.character_states or []:
+            if not isinstance(state, dict):
+                continue
+            name = state.get("character_name") or state.get("name") or state.get("character_id")
+            state_after = state.get("state_after") or state.get("psychological_change") or state.get("key_event")
+            if name and state_after:
+                character_states[str(name)] = str(state_after)
+
+    updated["open_threads"] = open_threads[-max_items:]
+    updated["character_states"] = dict(list(character_states.items())[-max_items:])
+    updated["updated_at"] = datetime.now().isoformat()
+    return updated
+
+
+def _record_chapter_result(
+    existing: Optional[List[Dict[str, Any]]],
+    chapter: Chapter,
+    scores: QualityScores,
+    gate_result: QualityGateResult,
+    validation_result: ChapterQualityValidationResult,
+    retry_count: int,
+    status: str,
+) -> List[Dict[str, Any]]:
+    results = list(existing or [])
+    results = [
+        item for item in results
+        if item.get("chapter_id") != chapter.id
+    ]
+    results.append(
+        {
+            "chapter_id": chapter.id,
+            "chapter_number": chapter.chapter_number,
+            "title": chapter.title,
+            "status": status,
+            "retry_count": retry_count,
+            "scores": {
+                "overall": scores.overall,
+                "coherence": scores.coherence,
+                "pacing": scores.pacing,
+                "engagement": scores.engagement,
+            },
+            "failing_scores": gate_result.failing_scores,
+            "validation_failures": validation_result.failing_checks,
+            "validation_metrics": validation_result.metrics,
+            "updated_at": datetime.now().isoformat(),
+        }
+    )
+    return results[-200:]
 
 
 def build_seed_chapter_plans_from_idea(task_input: Dict[str, Any], chapter_count: int) -> List[Dict[str, Any]]:
@@ -392,6 +907,8 @@ def build_quality_retry_instruction(
     scores: QualityScores,
     gate_result: QualityGateResult,
     analysis: Optional[Any],
+    validation_result: Optional[ChapterQualityValidationResult] = None,
+    consistency_instruction: str = "",
 ) -> str:
     """根据评分和分析建议生成更具体的质量重写指令。"""
     score_text = (
@@ -403,10 +920,25 @@ def build_quality_retry_instruction(
         suggestions = [str(item) for item in (analysis.suggestions or [])[:5] if str(item).strip()]
     suggestion_text = "\n".join(f"- {item}" for item in suggestions) or "- 强化冲突推进、人物动机和章节结尾钩子"
     failing = ", ".join(gate_result.failing_scores) or "unknown"
+    validation_text = ""
+    if validation_result and validation_result.failing_checks:
+        validation_map = {
+            "word_count": "章节字数不足，请扩写有效剧情和场景，不要用重复段落填充。",
+            "repetition": "章节重复度过高，请更换表达、推进新事件，避免复述上一章或循环同一句。",
+            "chapter_hook": "章节结尾缺少钩子，请补一个新的悬念、危机、反转或待解决问题。",
+            "generation_error": "上一轮生成失败，请重新输出完整章节正文。",
+        }
+        validation_text = "\n硬性校验未通过：\n" + "\n".join(
+            f"- {item}: {validation_map.get(item, '请修复该硬性质量问题。')}"
+            for item in validation_result.failing_checks
+        )
+    consistency_text = f"\n{consistency_instruction.strip()}\n" if consistency_instruction.strip() else ""
     return f"""请根据自动质量门结果重写本章，必须解决以下低分项：{failing}。
 当前评分：{score_text}
 分析建议：
 {suggestion_text}
+{validation_text}
+{consistency_text}
 
 重写要求：
 1. 保留原章节核心事件、人物关系和大纲目标，不要偏离主线。
@@ -681,7 +1213,8 @@ async def _run_writing_loop(
     quality_failures: List[Dict[str, Any]] = (
         list(previous_failures) if isinstance(previous_failures, list) else []
     )
-    consecutive_failures = 0
+    checkpoint = previous_result.get("checkpoint") or {}
+    consecutive_failures = int(checkpoint.get("consecutive_failures") or 0)
 
     while True:
         await db.refresh(task)
@@ -724,10 +1257,14 @@ async def _run_existing_project_batch(
     task_input = task.task_input or {}
     quality_input = task_input.get("quality") or {}
     quality_config = _quality_config_from_task_input(task_input)
+    policy = normalize_auto_writing_policy(task_input)
     chapters_per_batch = int(task_input.get("chapters_per_batch") or 1)
     target_words_per_chapter = int(task_input.get("target_words_per_chapter") or 3000)
     max_quality_retries = int(quality_input.get("max_quality_retries", 1))
     failure_limit = int(quality_input.get("consecutive_failure_limit", 3))
+    previous_task_result = task.task_result or {}
+    chapter_results = list(previous_task_result.get("chapter_results") or [])
+    consistency_ledger = dict(previous_task_result.get("consistency_ledger") or {})
 
     result = await db.execute(
         select(Chapter)
@@ -742,6 +1279,19 @@ async def _run_existing_project_batch(
         max_chapters=task_input.get("max_chapters"),
         current_chapter_count=starting_generated_count,
     ):
+        run_report = build_auto_writing_report(
+            generated_chapters=starting_generated_count,
+            quality_failures=existing_quality_failures or [],
+            policy=policy,
+            current_words=project.current_words or 0,
+            target_total_words=task_input.get("target_total_words"),
+        )
+        if policy.auto_export_enabled:
+            try:
+                run_report["export"] = await _export_project_chapters_for_auto_writing(db, project, user_id)
+            except Exception as exc:
+                logger.warning(f"自动写作完成后自动导出失败: {exc}")
+                run_report["export_error"] = str(exc)
         await _mark_task_completed(
             db,
             task,
@@ -750,6 +1300,9 @@ async def _run_existing_project_batch(
                 "message": "已达到目标字数或章节数",
                 "generated_chapters": starting_generated_count,
                 "quality_failures": existing_quality_failures or [],
+                "chapter_results": chapter_results,
+                "consistency_ledger": consistency_ledger,
+                "run_report": run_report,
             },
         )
         return {
@@ -791,6 +1344,15 @@ async def _run_existing_project_batch(
                     "message": "没有可生成章节，请先生成或展开大纲",
                     "generated_chapters": starting_generated_count,
                     "quality_failures": existing_quality_failures or [],
+                    "chapter_results": chapter_results,
+                    "consistency_ledger": consistency_ledger,
+                    "run_report": build_auto_writing_report(
+                        generated_chapters=starting_generated_count,
+                        quality_failures=existing_quality_failures or [],
+                        policy=policy,
+                        current_words=project.current_words or 0,
+                        target_total_words=task_input.get("target_total_words"),
+                    ),
                 },
             )
             return {
@@ -864,19 +1426,114 @@ async def _run_existing_project_batch(
             await db.refresh(task)
             return is_pause_or_cancel_requested(task)
 
-        try:
-            previous_summary_context = await generate_single_chapter_for_batch(
-                db_session=db,
-                chapter=chapter,
-                user_id=user_id,
-                style_id=task_input.get("style_id"),
-                target_word_count=target_words_per_chapter,
-                ai_service=ai_service,
-                write_lock=write_lock,
-                custom_model=task_input.get("model"),
-                previous_summary_context=previous_summary_context,
-                should_stop=should_stop_generation,
+        previous_context_for_validation = previous_summary_context or ""
+        generation_instructions = []
+        if policy.consistency_check_enabled:
+            consistency_instruction = build_consistency_guard_instruction(consistency_ledger)
+            if consistency_instruction:
+                generation_instructions.append(consistency_instruction)
+        if policy.volume_planning_enabled:
+            volume_instruction = build_volume_planning_instruction(
+                generated_chapters=starting_generated_count + generated_count,
+                target_total_words=task_input.get("target_total_words"),
+                current_words=project.current_words or 0,
             )
+            if volume_instruction:
+                generation_instructions.append(volume_instruction)
+        custom_generation_instructions = "\n\n".join(generation_instructions) or None
+        try:
+            operation_retry_count = 0
+            model_attempts = build_model_attempt_sequence(task_input.get("model"), policy.fallback_models)
+            while True:
+                last_generation_error: Optional[Exception] = None
+                for model_index, current_model in enumerate(model_attempts):
+                    try:
+                        previous_summary_context = await generate_single_chapter_for_batch(
+                            db_session=db,
+                            chapter=chapter,
+                            user_id=user_id,
+                            style_id=task_input.get("style_id"),
+                            target_word_count=target_words_per_chapter,
+                            ai_service=ai_service,
+                            write_lock=write_lock,
+                            custom_model=current_model,
+                            previous_summary_context=previous_summary_context,
+                            custom_instructions=custom_generation_instructions,
+                            should_stop=should_stop_generation,
+                        )
+                        last_generation_error = None
+                        break
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        last_generation_error = exc
+                        if model_index + 1 < len(model_attempts):
+                            next_model = model_attempts[model_index + 1] or "默认模型"
+                            await tracker.retry(model_index + 1, len(model_attempts) - 1, f"模型生成失败，切换备用模型: {next_model}")
+                        continue
+                if last_generation_error is None:
+                    break
+                operation_retry_count += 1
+                if operation_retry_count <= policy.max_operation_retries and policy.failure_strategy == "repair_and_continue":
+                    await tracker.retry(operation_retry_count, policy.max_operation_retries, f"章节生成失败，自动重试: {last_generation_error}")
+                    if policy.retry_backoff_seconds:
+                        await asyncio.sleep(policy.retry_backoff_seconds)
+                    continue
+                if policy.failure_strategy == "skip_chapter":
+                    logger.warning(f"自动写作跳过生成失败章节: chapter={chapter.id}, error={last_generation_error}")
+                    break
+                consecutive_failures += 1
+                quality_failures.append(
+                    build_enhanced_quality_failure_record(
+                        chapter_id=chapter.id,
+                        chapter_number=chapter.chapter_number,
+                        scores=QualityScores(0.0, 0.0, 0.0, 0.0),
+                        gate_result=QualityGateResult(passed=False, failing_scores=["generation"]),
+                        retry_count=operation_retry_count,
+                        validation_failures=["generation_error"],
+                        action=policy.failure_strategy,
+                    )
+                )
+                if policy.failure_strategy == "fail":
+                    _merge_task_result(task, {
+                        "message": f"第 {chapter.chapter_number} 章生成失败",
+                        "generated_chapters": starting_generated_count + generated_count,
+                        "quality_failures": quality_failures,
+                        "chapter_results": chapter_results,
+                        "checkpoint": {
+                            "last_failed_chapter_id": chapter.id,
+                            "last_failed_chapter_number": chapter.chapter_number,
+                            "consecutive_failures": consecutive_failures,
+                            "updated_at": datetime.now().isoformat(),
+                        },
+                        "run_report": build_auto_writing_report(
+                            generated_chapters=starting_generated_count + generated_count,
+                            quality_failures=quality_failures,
+                            policy=policy,
+                            current_words=project.current_words or 0,
+                            target_total_words=task_input.get("target_total_words"),
+                        ),
+                    })
+                    await _mark_task_failed(db, task, f"第 {chapter.chapter_number} 章生成失败: {last_generation_error}")
+                    return {
+                        "status": "failed",
+                        "generated_count": generated_count,
+                        "quality_failures": quality_failures,
+                        "consecutive_failures": consecutive_failures,
+                    }
+                await _mark_task_paused(
+                    db,
+                    task,
+                    f"第 {chapter.chapter_number} 章生成失败，任务已暂停: {last_generation_error}",
+                    starting_generated_count + generated_count,
+                    quality_failures,
+                )
+                return {
+                    "status": "paused",
+                    "generated_count": generated_count,
+                    "quality_failures": quality_failures,
+                    "consecutive_failures": consecutive_failures,
+                }
         except asyncio.CancelledError:
             await db.refresh(task)
             if task.cancel_requested or task.status == "cancelled":
@@ -893,6 +1550,100 @@ async def _run_existing_project_batch(
                 "quality_failures": quality_failures,
                 "consecutive_failures": consecutive_failures,
             }
+        if not (chapter.content or "").strip():
+            consecutive_failures += 1
+            if policy.failure_strategy == "skip_chapter":
+                chapter.status = "skipped"
+                chapter.summary = (chapter.summary or "") + "\n\n[自动写作] 本章生成失败后按策略跳过。"
+                await db.commit()
+                generated_count += 1
+            quality_failures.append(
+                build_enhanced_quality_failure_record(
+                    chapter_id=chapter.id,
+                    chapter_number=chapter.chapter_number,
+                    scores=QualityScores(0.0, 0.0, 0.0, 0.0),
+                    gate_result=QualityGateResult(passed=False, failing_scores=["generation"]),
+                    retry_count=policy.max_operation_retries,
+                    validation_failures=["generation_error"],
+                    action=policy.failure_strategy,
+                )
+            )
+            if policy.failure_strategy == "fail":
+                _merge_task_result(task, {
+                    "message": f"第 {chapter.chapter_number} 章生成失败",
+                    "generated_chapters": starting_generated_count + generated_count,
+                    "quality_failures": quality_failures,
+                    "chapter_results": chapter_results,
+                    "checkpoint": {
+                        "last_failed_chapter_id": chapter.id,
+                        "last_failed_chapter_number": chapter.chapter_number,
+                        "consecutive_failures": consecutive_failures,
+                        "updated_at": datetime.now().isoformat(),
+                    },
+                    "run_report": build_auto_writing_report(
+                        generated_chapters=starting_generated_count + generated_count,
+                        quality_failures=quality_failures,
+                        policy=policy,
+                        current_words=project.current_words or 0,
+                        target_total_words=task_input.get("target_total_words"),
+                    ),
+                })
+                await _mark_task_failed(db, task, f"第 {chapter.chapter_number} 章生成失败")
+                return {
+                    "status": "failed",
+                    "generated_count": generated_count,
+                    "quality_failures": quality_failures,
+                    "consecutive_failures": consecutive_failures,
+                }
+            chapter_results = _record_chapter_result(
+                chapter_results,
+                chapter,
+                QualityScores(0.0, 0.0, 0.0, 0.0),
+                QualityGateResult(passed=False, failing_scores=["generation"]),
+                ChapterQualityValidationResult(
+                    passed=False,
+                    failing_checks=["generation_error"],
+                    metrics={"word_count": 0},
+                ),
+                policy.max_operation_retries,
+                status="skipped" if policy.failure_strategy == "skip_chapter" else "failed",
+            )
+            if should_pause_for_auto_writing_failure(consecutive_failures, policy):
+                await _mark_task_paused(
+                    db,
+                    task,
+                    f"第 {chapter.chapter_number} 章生成失败，任务已暂停",
+                    starting_generated_count + generated_count,
+                    quality_failures,
+                )
+                return {
+                    "status": "paused",
+                    "generated_count": generated_count,
+                    "quality_failures": quality_failures,
+                    "consecutive_failures": consecutive_failures,
+                }
+            _merge_task_result(task, {
+                "message": "自动写作进行中",
+                "generated_chapters": starting_generated_count + generated_count,
+                "quality_failures": quality_failures,
+                "chapter_results": chapter_results,
+                "checkpoint": {
+                    "last_failed_chapter_id": chapter.id,
+                    "last_failed_chapter_number": chapter.chapter_number,
+                    "consecutive_failures": consecutive_failures,
+                    "updated_at": datetime.now().isoformat(),
+                },
+                "run_report": build_auto_writing_report(
+                    generated_chapters=starting_generated_count + generated_count,
+                    quality_failures=quality_failures,
+                    policy=policy,
+                    current_words=project.current_words or 0,
+                    target_total_words=task_input.get("target_total_words"),
+                ),
+            })
+            await db.commit()
+            continue
+
         generated_count += 1
 
         await db.refresh(task)
@@ -919,9 +1670,15 @@ async def _run_existing_project_batch(
         )
         scores = _scores_from_analysis(analysis)
         gate_result = evaluate_quality_gate(scores, quality_config)
+        validation_result = validate_generated_chapter_quality(
+            content=chapter.content or "",
+            target_word_count=target_words_per_chapter,
+            policy=policy,
+            previous_content_tail=previous_context_for_validation,
+        )
 
         retry_count = 0
-        while not gate_result.passed and retry_count < max_quality_retries:
+        while (not gate_result.passed or not validation_result.passed) and retry_count < max_quality_retries:
             retry_count += 1
             await tracker.retry(retry_count, max_quality_retries, "章节质量未达标，自动重写")
             await db.refresh(task)
@@ -950,24 +1707,108 @@ async def _run_existing_project_batch(
                 style_id=task_input.get("style_id"),
                 scores=scores,
                 gate_result=gate_result,
+                validation_result=validation_result,
+                consistency_instruction=custom_generation_instructions or "",
             )
             scores = _scores_from_analysis(analysis)
             gate_result = evaluate_quality_gate(scores, quality_config)
+            validation_result = validate_generated_chapter_quality(
+                content=chapter.content or "",
+                target_word_count=target_words_per_chapter,
+                policy=policy,
+                previous_content_tail=previous_context_for_validation,
+            )
 
-        if gate_result.passed:
+        if gate_result.passed and validation_result.passed:
             consecutive_failures = 0
         else:
             consecutive_failures += 1
             quality_failures.append(
-                build_quality_failure_record(
+                build_enhanced_quality_failure_record(
                     chapter_id=chapter.id,
                     chapter_number=chapter.chapter_number,
                     scores=scores,
                     gate_result=gate_result,
                     retry_count=retry_count,
+                    validation_failures=validation_result.failing_checks,
+                    validation_metrics=validation_result.metrics,
+                    action=policy.failure_strategy,
                 )
             )
-            if should_pause_for_quality_failures(consecutive_failures, failure_limit):
+            if policy.failure_strategy == "fail":
+                chapter_results = _record_chapter_result(
+                    chapter_results,
+                    chapter,
+                    scores,
+                    gate_result,
+                    validation_result,
+                    retry_count,
+                    status="failed",
+                )
+                _merge_task_result(task, {
+                    "message": f"第 {chapter.chapter_number} 章质量未达标",
+                    "generated_chapters": starting_generated_count + generated_count,
+                    "quality_failures": quality_failures,
+                    "chapter_results": chapter_results,
+                    "checkpoint": {
+                        "last_failed_chapter_id": chapter.id,
+                        "last_failed_chapter_number": chapter.chapter_number,
+                        "consecutive_failures": consecutive_failures,
+                        "updated_at": datetime.now().isoformat(),
+                    },
+                    "run_report": build_auto_writing_report(
+                        generated_chapters=starting_generated_count + generated_count,
+                        quality_failures=quality_failures,
+                        policy=policy,
+                        current_words=project.current_words or 0,
+                        target_total_words=task_input.get("target_total_words"),
+                    ),
+                })
+                await _mark_task_failed(db, task, f"第 {chapter.chapter_number} 章质量未达标")
+                return {
+                    "status": "failed",
+                    "generated_count": generated_count,
+                    "quality_failures": quality_failures,
+                    "consecutive_failures": consecutive_failures,
+                }
+            if policy.failure_strategy == "skip_chapter":
+                chapter.status = "skipped"
+                chapter.summary = (chapter.summary or "") + "\n\n[自动写作] 本章质量未达标后按策略跳过。"
+                generated_count += 1
+                chapter_results = _record_chapter_result(
+                    chapter_results,
+                    chapter,
+                    scores,
+                    gate_result,
+                    validation_result,
+                    retry_count,
+                    status="skipped",
+                )
+                _merge_task_result(task, {
+                    "message": f"第 {chapter.chapter_number} 章质量未达标，已跳过",
+                    "generated_chapters": starting_generated_count + generated_count,
+                    "quality_failures": quality_failures,
+                    "chapter_results": chapter_results,
+                    "checkpoint": {
+                        "last_failed_chapter_id": chapter.id,
+                        "last_failed_chapter_number": chapter.chapter_number,
+                        "consecutive_failures": consecutive_failures,
+                        "updated_at": datetime.now().isoformat(),
+                    },
+                    "run_report": build_auto_writing_report(
+                        generated_chapters=starting_generated_count + generated_count,
+                        quality_failures=quality_failures,
+                        policy=policy,
+                        current_words=project.current_words or 0,
+                        target_total_words=task_input.get("target_total_words"),
+                    ),
+                })
+                await db.commit()
+                continue
+            if (
+                should_pause_for_quality_failures(consecutive_failures, failure_limit)
+                or should_pause_for_auto_writing_failure(consecutive_failures, policy)
+            ):
                 await _mark_task_paused(
                     db,
                     task,
@@ -982,13 +1823,48 @@ async def _run_existing_project_batch(
                     "consecutive_failures": consecutive_failures,
                 }
 
+        if policy.consistency_check_enabled:
+            consistency_ledger = _update_consistency_ledger(
+                ledger=consistency_ledger,
+                chapter=chapter,
+                analysis=analysis,
+                summary_preview=previous_summary_context,
+            )
+        chapter_results = _record_chapter_result(
+            chapter_results,
+            chapter,
+            scores,
+            gate_result,
+            validation_result,
+            retry_count,
+            status="completed" if gate_result.passed and validation_result.passed else "warning",
+        )
         task.progress = min(95, int(index / len(selected_chapters) * 95))
         task.status_message = f"已完成 {index}/{len(selected_chapters)} 章"
-        task.task_result = {
+        _merge_task_result(task, {
             "message": "自动写作进行中",
             "generated_chapters": starting_generated_count + generated_count,
             "quality_failures": quality_failures,
-        }
+            "chapter_results": chapter_results,
+            "consistency_ledger": consistency_ledger,
+            "checkpoint": {
+                "last_completed_chapter_id": chapter.id,
+                "last_completed_chapter_number": chapter.chapter_number,
+                "consecutive_failures": consecutive_failures,
+                "updated_at": datetime.now().isoformat(),
+            },
+            "run_report": build_auto_writing_report(
+                generated_chapters=starting_generated_count + generated_count,
+                quality_failures=quality_failures,
+                policy=policy,
+                current_words=project.current_words or 0,
+                target_total_words=task_input.get("target_total_words"),
+                token_usage={
+                    "estimated_total": int((project.current_words or 0) * 2),
+                    "budget_token_limit": policy.budget_token_limit,
+                },
+            ),
+        })
         task.updated_at = datetime.now()
         await db.commit()
 
@@ -1010,7 +1886,8 @@ async def _extend_story_if_needed(
     tracker: TaskProgressTracker,
 ) -> int:
     """没有可写草稿时自动追加后续大纲与章节草稿。"""
-    if task_input.get("auto_expand_outline", True) is False:
+    policy = normalize_auto_writing_policy(task_input)
+    if not policy.auto_expand_outline:
         return 0
     if not should_continue_writing(
         current_words=project.current_words or 0,
@@ -1059,6 +1936,22 @@ async def _extend_story_if_needed(
     last_number = max_number_result.scalar_one_or_none() or 0
     created = await _create_outline_chapters_from_plans(db, project, plans, start_number=last_number + 1)
     project.chapter_count = max(project.chapter_count or 0, last_number + created)
+    outline_extensions = list((task.task_result or {}).get("outline_extensions") or [])
+    outline_extensions.append(
+        {
+            "start_chapter": last_number + 1,
+            "created": created,
+            "requested": extend_count,
+            "created_at": datetime.now().isoformat(),
+        }
+    )
+    _merge_task_result(
+        task,
+        {
+            "outline_extensions": outline_extensions[-100:],
+            "message": f"已自动追加 {created} 个后续章节大纲",
+        },
+    )
     await db.commit()
     return created
 
@@ -1167,6 +2060,8 @@ async def _regenerate_apply_and_analyze(
     style_id: Optional[int],
     scores: Optional[QualityScores] = None,
     gate_result: Optional[QualityGateResult] = None,
+    validation_result: Optional[ChapterQualityValidationResult] = None,
+    consistency_instruction: str = "",
 ) -> Optional[PlotAnalysis]:
     from app.services.chapter_regenerator import ChapterRegenerator
 
@@ -1179,6 +2074,8 @@ async def _regenerate_apply_and_analyze(
             scores=scores or _scores_from_analysis(analysis),
             gate_result=gate_result or QualityGateResult(passed=False, failing_scores=["overall"]),
             analysis=analysis,
+            validation_result=validation_result,
+            consistency_instruction=consistency_instruction,
         ),
         preserve_elements=PreserveElementsConfig(preserve_structure=True, preserve_character_traits=True),
         style_id=style_id,
@@ -1316,11 +2213,16 @@ async def _mark_task_paused(
 ) -> None:
     task.status = "paused"
     task.status_message = message
-    task.task_result = {
+    _merge_task_result(task, {
         "message": message,
         "generated_chapters": generated_count,
         "quality_failures": quality_failures,
-    }
+        "checkpoint": {
+            "generated_chapters": generated_count,
+            "quality_failure_count": len(quality_failures),
+            "updated_at": datetime.now().isoformat(),
+        },
+    })
     task.progress_details = {"stage": "paused", "message": message}
     task.updated_at = datetime.now()
     await db.commit()

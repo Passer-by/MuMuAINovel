@@ -2,7 +2,7 @@
  * 后台任务服务 - 轮询任务进度，替代SSE
  */
 
-import type { BackgroundTaskStatusValue } from '../types';
+import type { AutoWritingTaskResult, BackgroundTaskStatusValue } from '../types';
 
 const API_BASE = '/api/tasks';
 
@@ -17,11 +17,16 @@ export interface TaskStatus {
     stage: string;
     message?: string;
     current_chars?: number;
+    estimated_total?: number;
     retry_count?: number;
     queue_size?: number;
+    generated_chapters?: number;
+    quality_failure_count?: number;
+    current_chapter_number?: number;
+    [key: string]: unknown;
   } | null;
   error_message: string | null;
-  task_result: Record<string, unknown> | null;
+  task_result: AutoWritingTaskResult | Record<string, unknown> | null;
   retry_count: number;
   cancel_requested: boolean;
   created_at: string | null;

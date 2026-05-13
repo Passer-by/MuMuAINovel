@@ -26,6 +26,11 @@ import {
   type TaskStatus,
 } from '../services/backgroundTaskService';
 import { eventBus } from '../store/eventBus';
+import type {
+  AutoWritingFailureRecord,
+  AutoWritingRunReport,
+  AutoWritingTaskResult,
+} from '../types';
 
 interface FloatingTaskPanelProps {
   projectId: string;
@@ -205,6 +210,92 @@ export const FloatingTaskPanel: React.FC<FloatingTaskPanelProps> = ({
     }
   };
 
+  const isRecord = (value: unknown): value is Record<string, unknown> =>
+    typeof value === 'object' && value !== null;
+
+  const toNumber = (value: unknown): number | undefined => {
+    if (typeof value === 'number' && Number.isFinite(value)) return value;
+    if (typeof value === 'string' && value.trim()) {
+      const numberValue = Number(value);
+      return Number.isFinite(numberValue) ? numberValue : undefined;
+    }
+    return undefined;
+  };
+
+  const formatPercent = (value: unknown): string | undefined => {
+    const numberValue = toNumber(value);
+    if (numberValue === undefined) return undefined;
+    const percent = numberValue <= 1 ? numberValue * 100 : numberValue;
+    return `${Math.round(percent)}%`;
+  };
+
+  const getAutoWritingTaskResult = (task: TaskStatus): AutoWritingTaskResult | undefined =>
+    isRecord(task.task_result) ? task.task_result as AutoWritingTaskResult : undefined;
+
+  const getRunReport = (result?: AutoWritingTaskResult): AutoWritingRunReport | undefined =>
+    isRecord(result?.run_report) ? result.run_report as AutoWritingRunReport : undefined;
+
+  const getLatestFailure = (result?: AutoWritingTaskResult): AutoWritingFailureRecord | undefined => {
+    const failures = result?.quality_failures;
+    if (!Array.isArray(failures) || failures.length === 0) return undefined;
+    const latest = failures[failures.length - 1];
+    return isRecord(latest) ? latest as AutoWritingFailureRecord : undefined;
+  };
+
+  const renderAutoWritingSummary = (task: TaskStatus) => {
+    if (!isAutoWritingTask(task)) return null;
+
+    const result = getAutoWritingTaskResult(task);
+    const report = getRunReport(result);
+    const latestFailure = getLatestFailure(result);
+    const qualityFailureCount = toNumber(
+      report?.quality_failure_count ?? result?.quality_failures?.length,
+    );
+    const generatedChapters = toNumber(
+      report?.generated_chapters ?? result?.generated_chapters ?? task.progress_details?.generated_chapters,
+    );
+    const completion = formatPercent(
+      report?.completion_ratio ?? result?.completion_ratio ?? task.progress,
+    );
+    const retryCount = toNumber(latestFailure?.retry_count ?? task.progress_details?.retry_count ?? task.retry_count);
+    const latestFailureCheck = latestFailure?.validation_failures?.[0] || latestFailure?.failing_scores?.[0];
+    const tokenUsage = isRecord(report?.token_usage) ? report.token_usage : undefined;
+    const tokenEstimate = toNumber(
+      tokenUsage?.estimated_total ?? tokenUsage?.total_tokens,
+    );
+    const exportInfo = isRecord(report?.export) ? report.export : undefined;
+    const exportUrl = typeof exportInfo?.url === 'string' ? exportInfo.url : undefined;
+    const exportName = typeof exportInfo?.filename === 'string' ? exportInfo.filename : '导出文件';
+    const exportError = typeof report?.export_error === 'string' ? report.export_error : undefined;
+    const hasSummary = generatedChapters !== undefined
+      || qualityFailureCount !== undefined
+      || completion
+      || latestFailure
+      || report
+      || exportUrl
+      || exportError;
+
+    if (!hasSummary) return null;
+
+    return (
+      <div style={{ fontSize: 12, color: token.colorTextSecondary, marginBottom: 4 }}>
+        <Space size={[4, 4]} wrap>
+          {generatedChapters !== undefined && <Tag>已生成 {generatedChapters} 章</Tag>}
+          {qualityFailureCount !== undefined && <Tag color={qualityFailureCount > 0 ? 'warning' : 'success'}>质量失败 {qualityFailureCount} 次</Tag>}
+          {completion && <Tag color="blue">完成率 {completion}</Tag>}
+          {latestFailure?.chapter_number !== undefined && <Tag color="orange">最近失败 第{latestFailure.chapter_number}章</Tag>}
+          {latestFailureCheck && <Tag color="orange">失败检查 {latestFailureCheck}</Tag>}
+          {retryCount !== undefined && <Tag>重试 {retryCount} 次</Tag>}
+          {report?.failure_strategy && <Tag color="purple">策略 {report.failure_strategy}</Tag>}
+          {report?.auto_recover !== undefined && <Tag color={report.auto_recover ? 'green' : 'default'}>自动恢复 {report.auto_recover ? '开' : '关'}</Tag>}
+          {tokenEstimate !== undefined && <Tag color="cyan">Token 估算 {tokenEstimate}</Tag>}
+          {exportUrl && <Tag color="green"><a href={exportUrl} target="_blank" rel="noreferrer">导出 {exportName}</a></Tag>}
+          {exportError && <Tag color="red">导出失败</Tag>}
+        </Space>
+      </div>
+    );
+  };
+
   const activeTasks = taskList.filter((t) => isRefreshingStatus(t.status));
   const hasActiveTasks = activeTasks.length > 0;
 
@@ -317,6 +408,8 @@ export const FloatingTaskPanel: React.FC<FloatingTaskPanelProps> = ({
                           {task.status_message}
                         </div>
                       )}
+
+                      {renderAutoWritingSummary(task)}
 
                       {isRefreshingStatus(task.status) && (
                         <Progress

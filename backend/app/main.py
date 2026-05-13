@@ -179,7 +179,10 @@ app.include_router(auto_writing.router, prefix="/api")  # 自动写作API
 static_dir = Path(__file__).parent.parent / "static"
 generated_assets_root_dir = Path(__file__).parent.parent / "storage"
 generated_covers_dir = generated_assets_root_dir / "generated_covers"
+auto_writing_exports_dir = generated_assets_root_dir / "auto_writing_exports"
 generated_covers_dir.mkdir(parents=True, exist_ok=True)
+auto_writing_exports_dir.mkdir(parents=True, exist_ok=True)
+app.mount("/generated-assets/auto-writing", StaticFiles(directory=str(auto_writing_exports_dir)), name="auto-writing-exports")
 if static_dir.exists():
     app.mount("/assets", StaticFiles(directory=str(static_dir / "assets")), name="assets")
     app.mount("/generated-assets/covers", StaticFiles(directory=str(generated_covers_dir)), name="generated-covers")

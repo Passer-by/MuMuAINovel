@@ -26,6 +26,28 @@ class AutoWritingQualityConfig(BaseModel):
     )
 
 
+class AutoWritingAutomationPolicy(BaseModel):
+    """无人值守自动写作策略"""
+
+    auto_expand_outline: bool = Field(True, description="没有草稿章节时自动扩展后续大纲")
+    auto_recover: bool = Field(True, description="允许任务恢复时从 checkpoint 继续")
+    failure_strategy: Literal["repair_and_continue", "pause", "skip_chapter", "fail"] = Field(
+        "repair_and_continue",
+        description="生成/质量失败后的处理策略",
+    )
+    max_operation_retries: int = Field(3, ge=0, le=20, description="非质量类操作最大重试次数")
+    retry_backoff_seconds: int = Field(10, ge=0, le=3600, description="操作重试等待秒数")
+    min_word_ratio: float = Field(0.8, ge=0, le=2, description="章节最低字数比例")
+    repetition_check_chars: int = Field(800, ge=0, le=10000, description="重复检测采样字符数")
+    max_repetition_ratio: float = Field(0.6, ge=0, le=1, description="最大重复比例")
+    require_chapter_hook: bool = Field(False, description="是否要求章节结尾具备钩子")
+    consistency_check_enabled: bool = Field(True, description="启用长篇一致性账本")
+    volume_planning_enabled: bool = Field(True, description="启用卷级/阶段规划提示")
+    auto_export_enabled: bool = Field(False, description="完成后自动导出")
+    budget_token_limit: Optional[int] = Field(None, ge=1, description="估算 token 预算上限")
+    fallback_models: Optional[Any] = Field(None, description="备用模型列表或逗号分隔字符串")
+
+
 class AutoWritingStartRequest(BaseModel):
     """启动自动写作请求"""
 
@@ -47,6 +69,7 @@ class AutoWritingStartRequest(BaseModel):
         validation_alias=AliasChoices("quality", "quality_config"),
         serialization_alias="quality",
     )
+    automation_policy: AutoWritingAutomationPolicy = Field(default_factory=AutoWritingAutomationPolicy)
 
     @model_validator(mode="after")
     def validate_mode_inputs(self):
